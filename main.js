@@ -38,7 +38,12 @@ const canvas = document.getElementById('view');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
 renderer.setPixelRatio(1);
 
-const world = buildWorld();
+// Same seed => same level on every client. Multiplayer: have the server send this number.
+// Try ?seed=1234 in the URL; with no seed a random one is picked and written to the URL so you can share it.
+const params = new URLSearchParams(location.search);
+const seed = Number.isFinite(parseInt(params.get('seed'), 10)) ? parseInt(params.get('seed'), 10) : (Math.random() * 1e9) | 0;
+if (!params.has('seed')) { params.set('seed', seed); history.replaceState(null, '', '?' + params); }
+const world = buildWorld(seed);
 
 const voxelTex = new THREE.Data3DTexture(world.data, world.size.x, world.size.y, world.size.z);
 voxelTex.format = THREE.RedFormat;
@@ -147,9 +152,11 @@ const physics = await createPhysics(world);   // collision mesh + Rapier world (
 
 warmUp();   // JIT the explosion code on a scratch grid so the first real blast doesn't hitch
 
-const spawn = { x: (world.start.tx + 0.5) * TILE_M, y: 0, z: (world.start.tz + 0.5) * TILE_M };
+// world.spawns are spread across the map (farthest-point sampling). Multiplayer: the server assigns the index.
+const spawnPoint = world.spawns[(parseInt(params.get('spawn'), 10) || 0) % world.spawns.length];
+const spawn = { x: (spawnPoint.tx + 0.5) * TILE_M, y: 0, z: (spawnPoint.tz + 0.5) * TILE_M };
 const player = new Player(physics, spawn);    // tweak the feel: new Player(physics, spawn, { walkSpeed: 5, jumpHeight: 1.3 })
-const input = new Input(canvas, { yaw: Math.PI / 2 });   // start facing down the first corridor (+X)
+const input = new Input(canvas, { yaw: spawnPoint.yaw });   // spawn facing along the longest open run
 
 const hint = document.getElementById('hint');
 if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · F3 debug · Esc release mouse · Click: fire grenade · Right click: heavy shell (hold to keep firing)';
