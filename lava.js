@@ -102,6 +102,21 @@ export class LavaSim {
     const [cx, cy, cz] = this.cellOfVoxel(vx, vy, vz);
     if (this.inGrid(cx, cy, cz)) this.sources.push({ cx, cy, cz });
   }
+  // A droplet landed at `point` (voxels) on a surface with `normal`. Put one cell in the free air cell just
+  // off the surface; if that is taken (the pile is already there) climb, then try the neighbours, so a
+  // steady stream builds a heap that the normal settle bursts then slump into a pool.
+  splat(point, normal) {
+    const C = this.C;
+    const px = point[0] + normal[0] * C * 0.5, py = point[1] + normal[1] * C * 0.5, pz = point[2] + normal[2] * C * 0.5;
+    const [cx, cy, cz] = this.cellOfVoxel(px, py, pz);
+    const tries = [[0, 0, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]];
+    for (let up = 0; up <= 6; up++) {
+      for (const [dx, , dz] of tries) {
+        if (this.isFree(cx + dx, cy + up, cz + dz)) { this.place(cx + dx, cy + up, cz + dz); return true; }
+      }
+    }
+    return false;
+  }
   clear() {
     for (const i of [...this.all]) {
       const cx = i % this.gx, r = (i / this.gx) | 0, cy = r % this.gy, cz = (r / this.gy) | 0;

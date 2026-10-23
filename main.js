@@ -10,6 +10,7 @@ import { Projectiles } from './projectiles.js';
 import { DebugOverlay } from './debug.js';
 import { Minimap } from './minimap.js';
 import { LavaSim } from './lava.js';
+import { LavaGun } from './lavagun.js';
 
 // ---------------------------------------------------------------- settings
 const INTERNAL_HEIGHT = 360;   // render resolution (width follows aspect ratio)
@@ -125,6 +126,7 @@ const uniforms = {
   uParticles: { value: particleTex },
   uGunOff: { value: new THREE.Vector3() },
   uMuzzle: { value: 0 },
+  uGunType: { value: 0 },
   uParticleCount: { value: 0 },
   uPBound: { value: new THREE.Vector4() },
 };
@@ -168,7 +170,8 @@ const mapCap = document.getElementById('mapcap');
 if (mapCap) mapCap.textContent = `SEED ${seed}`;
 
 const hint = document.getElementById('hint');
-if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · M map · F3 debug · Esc release mouse · L: pour lava at crosshair (Shift+L clear) · Click: fire grenade · Right click: heavy shell (hold to keep firing)';
+const modeEl = document.getElementById('mapcap');   // reuse the caption under the minimap for the gun mode
+if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · M map · F3 debug · Esc release mouse · Shift+L: clear lava · Scroll wheel (or G): swap grenades / LAVA GUN · Click: fire (lava gun: hold to spray) · Right click: heavy shell (hold to keep firing)';
 
 // ---------------------------------------------------------------- F3 debug overlay
 const stats = { shots: 0, blasts: 0, lastBlast: null };   // counters updated by shoot() / detonate()
@@ -299,7 +302,8 @@ let bobPhase = 0, bobAmt = 0;
 const sway = { x: 0, y: 0 };
 let lastYaw = 0, lastPitch = 0;
 
-function shoot(shot) {
+// where the muzzle is and which way it points (shared by the shells and the lava gun)
+function aimGun() {
   const { forward, right, up } = Player.basis(input.yaw, input.pitch);
   player.eyeVoxels(eye);
 
@@ -319,6 +323,11 @@ function shoot(shot) {
   const toBarrel = [barrel[0] - eye.x, barrel[1] - eye.y, barrel[2] - eye.z];
   const bl = Math.hypot(...toBarrel) || 1;
   if (raycastVoxels(world, [eye.x, eye.y, eye.z], toBarrel.map((v) => v / bl), bl)) start = [eye.x, eye.y, eye.z];
+  return { start, dir };
+}
+
+function shoot(shot) {
+  const { start, dir } = aimGun();
 
   const sp = shot.speed * M2V;
   projectiles.spawn(start, [
@@ -337,22 +346,23 @@ function shoot(shot) {
 // LavaSim (lava.js) writes id-8 voxels into world.data; we push the changed box to the GPU like explosions do.
 const LAVA_STEP = 1 / 30;                 // sim ticks per second: 30
 const lava = new LavaSim(world, { cell: 2, width: 1, viscosity: 0.6, reach: 8, period: 15, passes: 15 });
-let lavaAcc = 0, lavaSeeded = false, lavaLightK = 0, lavaLightStr = 0;
+let lavaAcc = 0, lavaLightK = 0, lavaLightStr = 0;
 const lavaLightPos = new THREE.Vector3();
 
-function pourLava(pitch = input.pitch) {   // source 3 cells above whatever the crosshair hits, so it falls and pools
-  const { forward } = Player.basis(input.yaw, pitch);
-  player.eyeVoxels(eye);
-  const hit = raycastVoxels(world, [eye.x, eye.y, eye.z], forward, 60 * M2V);
-  if (!hit) return;
-  const p = hit.point.map((v, i) => v + hit.normal[i] * 1.5);
-  lava.addSource(p[0], p[1] + 5 * lava.C, p[2]);
-}
 addEventListener('keydown', (e) => {
   if (e.code !== 'KeyL' || e.repeat) return;
   if (e.shiftKey) { lava.clear(); const b = lava.flush(); if (b) { uploadVoxelBox(b); coarseTex.needsUpdate = true; } }
-  else pourLava();
 });
+
+// ---------------------------------------------------------------- lava gun (G toggles; left click sprays, hold to keep pouring)
+const lavaGun = new LavaGun(world, lava, { rate: 90, speed: 30 * M2V, spread: 0.025, gravity: 7 * M2V });
+let lavaMode = false;                       // which gun is actually in hand (switches halfway through the swap animation)
+let wantLava = false, swapT = 1;            // swapT: 0..1 = swap in progress, 1 = idle
+function selectGun(lava) {                  // scroll wheel / G: lower the gun, switch model, raise it again
+  if (lava === wantLava && swapT >= 1) return;
+  wantLava = lava; swapT = 0;
+}
+addEventListener('keydown', (e) => { if (e.code === 'KeyG' && !e.repeat) selectGun(!wantLava); });
 
 // ---------------------------------------------------------------- loop
 let last = performance.now();
@@ -375,11 +385,29 @@ function frame(now) {
   while (acc >= FIXED_DT) {
     player.tick(input.sample());
     projectiles.update(FIXED_DT);
+    lavaGun.update(FIXED_DT);
     acc -= FIXED_DT;
+  }
+  const wheel = input.consumeWheel();                          // trackpads spam events: ignore them while a swap is running
+  if (wheel && input.locked && swapT >= 1) selectGun(!wantLava);
+  if (swapT < 1) {
+    swapT = Math.min(1, swapT + dt / 0.32);
+    if (swapT >= 0.5 && lavaMode !== wantLava) {                 // gun is off-screen: swap the model
+      lavaMode = wantLava;
+      uniforms.uGunType.value = lavaMode ? 1 : 0;
+      if (modeEl) modeEl.textContent = `SEED ${seed} · ${lavaMode ? 'LAVA GUN' : 'GRENADES'}`;
+      gunCooldown = Math.max(gunCooldown, 0.1);
+    }
   }
   const fire = input.consumeFire() || input.fireHeld;
   gunCooldown -= dt;
-  if (fire && gunCooldown <= 0 && input.locked) shoot(fire === 2 ? SHOTS.big : SHOTS.small);
+  if (swapT < 1) { /* gun is changing */ }
+  else if (lavaMode && fire === 1 && input.locked) {
+    const { start, dir } = aimGun();
+    lavaGun.emit(dt, start, dir, [player.vx * M2V * INHERIT_VELOCITY, player.vy * M2V * INHERIT_VELOCITY, player.vz * M2V * INHERIT_VELOCITY]);
+    gunMuzzle = Math.max(gunMuzzle, 0.55);                     // keep the muzzle glowing while it sprays
+    gunKick = Math.max(gunKick, 0.12);
+  } else if (fire && gunCooldown <= 0 && input.locked) shoot(fire === 2 ? SHOTS.big : SHOTS.small);
 
   player.alpha = acc / FIXED_DT;
   player.frameUpdate(dt);
@@ -434,7 +462,7 @@ function frame(now) {
   sway.y = Math.max(-2, Math.min(2, sway.y - dpitch * 18)) * Math.exp(-9 * dt);
   uniforms.uGunOff.value.set(
     Math.sin(bobPhase) * 0.35 * bobAmt + sway.x,
-    -Math.abs(Math.cos(bobPhase)) * 0.45 * bobAmt + Math.sin(time * 1.3) * 0.05 + 0.9 * gunKick + sway.y,
+    -Math.abs(Math.cos(bobPhase)) * 0.45 * bobAmt + Math.sin(time * 1.3) * 0.05 + 0.9 * gunKick + sway.y - 9 * Math.sin(Math.PI * swapT),
     -3.0 * gunKick);
   uniforms.uMuzzle.value = gunMuzzle > 0.03 ? gunMuzzle : 0;
 
@@ -445,6 +473,13 @@ function frame(now) {
     const pp = projectiles.interpolated(acc / FIXED_DT, i);
     lightPos[BASE_LIGHTS + used].set(pp[0], pp[1], pp[2]);
     lightCol[BASE_LIGHTS + used].set(1.0, 0.6, 0.25).multiplyScalar((projectiles.list[i].big ? 3.4 : 2.4) * (1 + 0.2 * Math.sin(time * 40 + i)));
+  }
+
+  const lc = lavaGun.centroid();
+  if (lc && used < dynSlots) {
+    lightPos[BASE_LIGHTS + used].set(lc[0], lc[1], lc[2]);
+    lightCol[BASE_LIGHTS + used].set(1.0, 0.42, 0.1).multiplyScalar(2.6 * (1 + 0.15 * Math.sin(time * 37)));
+    used++;
   }
 
   // explosion flashes occupy the light slots after the torch and braziers
@@ -462,7 +497,6 @@ function frame(now) {
   uniforms.uLightCount.value = BASE_LIGHTS + used + (flashes.length - firstFlash);
 
   // lava: fixed-rate sim, upload the dirty box, light follows the pool
-  if (!lavaSeeded) { lavaSeeded = true; pourLava(-0.45); }   // a first pour ahead of the spawn so there is something to see
   lavaAcc += dt;
   for (let n = 0; lavaAcc >= LAVA_STEP && n < 3; n++) { lava.step(); lavaAcc -= LAVA_STEP; }
   if (lavaAcc > LAVA_STEP * 3) lavaAcc = 0;
@@ -480,7 +514,7 @@ function frame(now) {
 
   // particles: simulate, pack, upload only while something is alive
   particles.update(dt);
-  const shells = projectiles.cubes(acc / FIXED_DT);
+  const shells = projectiles.cubes(acc / FIXED_DT).concat(lavaGun.cubes(acc / FIXED_DT));
   if (particles.count > 0 || shells.length > 0 || particlesLive) {
     particles.pack(shells);
     uniforms.uParticleCount.value = particles.packed;

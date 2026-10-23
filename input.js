@@ -15,6 +15,7 @@ export class Input {
     this._toggleFly = false;
     this.fireHeld = 0;                            // 1 / 2 while the left / right button is held
     this._fire = 0;                               // 1 = left click, 2 = right click (only while the mouse is captured)
+    this._wheel = 0;                              // accumulated scroll direction (+1 / -1 per notch) while the mouse is captured
 
     const block = new Set(['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'ControlLeft', 'Tab']);
 
@@ -40,6 +41,11 @@ export class Input {
       if ((e.button === 0 && this.fireHeld === 1) || (e.button === 2 && this.fireHeld === 2)) this.fireHeld = 0;
     });
     canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+    addEventListener('wheel', (e) => {
+      if (document.pointerLockElement !== canvas) return;
+      e.preventDefault();
+      this._wheel += Math.sign(e.deltaY);
+    }, { passive: false });
     addEventListener('mousemove', (e) => {
       if (document.pointerLockElement !== canvas) return;
       this.yaw += e.movementX * this.sens;
@@ -51,6 +57,9 @@ export class Input {
 
   // once per rendered frame: returns 0 (nothing), 1 (left click) or 2 (right click) and clears it
   consumeFire() { const f = this._fire; this._fire = 0; return f; }
+
+  // once per rendered frame: scroll notches since the last call (sign only), then cleared
+  consumeWheel() { const w = this._wheel; this._wheel = 0; return Math.sign(w); }
 
   // once per rendered frame: arrow-key look
   frameUpdate(dt) {
