@@ -22,7 +22,7 @@ uniform float uTime;
 uniform float uLevels;      // colour levels per channel after dithering
 uniform float uAmbient;     // ambient light strength
 uniform float uSoft;        // shadow jitter radius (voxels) -> soft shadows
-uniform float uEmissive;    // brightness of emissive voxels (id >= 6)
+uniform float uEmissive;    // brightness of emissive voxels (id == 6)
 uniform float uDither;      // dither strength: 0 = banding, 1 = full Bayer
 uniform float uInvScale;    // 4 / voxelsPerTile: converts voxel distances to the old unit scale
 uniform float uBlock;       // size (voxels) of the blocky colour-variation cells
@@ -171,7 +171,7 @@ vec3 sky(vec3 rd) {
 vec3 shade(Hit h, vec3 ro, vec3 rd) {
   vec3 p = ro + rd * h.t;
 
-  if (h.id >= EMISSIVE_ID) {
+  if (h.id == EMISSIVE_ID) {
     float fl = 0.85 + 0.3 * hash13(floor(vec3(h.cell) / uBlock) + floor(uTime * 8.0));
     return uPalette[h.id] * uEmissive * fl;
   }

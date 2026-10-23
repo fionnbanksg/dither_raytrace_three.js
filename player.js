@@ -73,6 +73,7 @@ export class Player {
     this.fly = false;
     this.coyote = 0;
     this.buffer = 0;
+    this.launched = false;    // true after knock(): disables the short-hop cut until we start falling
     this.stepOffset = 0;      // visual-only smoothing for step-ups
     this.alpha = 1;           // interpolation factor set by the loop
   }
@@ -117,7 +118,8 @@ export class Player {
       this.vy = Math.sqrt(2 * o.gravity * o.jumpHeight);
       this.buffer = 0; this.coyote = 0; jumped = true;
     }
-    if (!intent.jumpHeld && this.vy > 0 && !jumped) this.vy *= Math.pow(o.jumpCut, dt * 60);   // short hop
+    if (this.vy <= 0 || this.onGround) this.launched = false;
+    if (!intent.jumpHeld && this.vy > 0 && !jumped && !this.launched) this.vy *= Math.pow(o.jumpCut, dt * 60);   // short hop
 
     // ---- gravity
     if (this.onGround && this.vy <= 0 && !jumped) this.vy = 0;
@@ -146,6 +148,12 @@ export class Player {
     this.x += m.x; this.y += m.y; this.z += m.z;
     this.body.setNextKinematicTranslation({ x: this.x, y: this.y, z: this.z });
     this.physics.world.step();
+  }
+
+  // Explosion / external push: adds to the current velocity (metres per second).
+  knock(vx, vy, vz) {
+    this.vx += vx; this.vy += vy; this.vz += vz;
+    if (!this.fly && vy > 0) { this.onGround = false; this.coyote = 0; this.launched = true; }
   }
 
   _tickFly(intent, dt) {

@@ -21,7 +21,7 @@ export const PALETTE = [
   [0.45, 0.22, 0.08], // 4 wood
   [0.55, 0.14, 0.10], // 5 brick
   [1.00, 0.60, 0.20], // 6 emissive flame
-  [0.30, 0.30, 0.50], // 7 (spare)
+  [0.13, 0.115, 0.105], // 7 scorched stone (explosion soot)
 ];
 
 // '#': wall   '.': floor   'g': grass floor   'S': start   'B': timber doorway   'L': brazier
@@ -55,7 +55,7 @@ function hash3(x, y, z, s) {
   h ^= h >>> 16;
   return (h >>> 0) / 4294967296;
 }
-function vnoise(x, y, z, s) {
+export function vnoise(x, y, z, s) {
   const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
   const fx = x - xi, fy = y - yi, fz = z - zi;
   const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy), w = fz * fz * (3 - 2 * fz);
@@ -188,7 +188,8 @@ export function buildWorld(seed = 1337) {
     for (let lz = c - S; lz < c + S; lz++) for (let lx = c - S; lx < c + S; lx++) {
       for (let y = 3 * S + 1; y <= 5 * S; y++) data[idx(x0 + lx, y, z0 + lz)] = 6;          // flame
     }
-    lights.push({ pos: [x0 + c, 7 * S, z0 + c], color: [1.0, 0.5, 0.2], intensity: 3.0 });
+    lights.push({ pos: [x0 + c, 7 * S, z0 + c], color: [1.0, 0.5, 0.2], intensity: 3.0,
+                  anchor: [x0 + c, 4 * S, z0 + c] });   // a flame voxel: if it's destroyed the light goes out
   }
 
   // 6. coarse occupancy grid (1 = brick contains any solid voxel) for empty-space skipping

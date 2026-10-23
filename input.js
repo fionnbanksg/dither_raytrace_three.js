@@ -13,6 +13,7 @@ export class Input {
     this.keys = new Set();
     this._jumpPressed = false;
     this._toggleFly = false;
+    this._fire = 0;                               // 1 = left click, 2 = right click (only while the mouse is captured)
 
     const block = new Set(['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'ControlLeft', 'Tab']);
 
@@ -29,6 +30,12 @@ export class Input {
     canvas.addEventListener('click', () => {
       if (document.pointerLockElement !== canvas) canvas.requestPointerLock?.();
     });
+    canvas.addEventListener('mousedown', (e) => {
+      if (document.pointerLockElement !== canvas) return;   // the click that captures the mouse doesn't fire
+      if (e.button === 0) this._fire = 1;
+      else if (e.button === 2) this._fire = 2;
+    });
+    canvas.addEventListener('contextmenu', (e) => e.preventDefault());
     addEventListener('mousemove', (e) => {
       if (document.pointerLockElement !== canvas) return;
       this.yaw += e.movementX * this.sens;
@@ -37,6 +44,9 @@ export class Input {
   }
 
   get locked() { return document.pointerLockElement === this.canvas; }
+
+  // once per rendered frame: returns 0 (nothing), 1 (left click) or 2 (right click) and clears it
+  consumeFire() { const f = this._fire; this._fire = 0; return f; }
 
   // once per rendered frame: arrow-key look
   frameUpdate(dt) {

@@ -3,7 +3,8 @@ import { buildWorld, PALETTE, T } from './world.js';
 import { vert, frag } from './shader.js';
 import { Player } from './player.js';
 import { Input } from './input.js';
-import { createPhysics, FIXED_DT, TILE_M } from './physics.js';
+import { createPhysics, FIXED_DT, TILE_M, M2V, mToVoxX, mToVoxY, mToVoxZ } from './physics.js';
+import { explode, raycastVoxels, voxelAt, warmUp } from './destruction.js';
 
 // ---------------------------------------------------------------- settings
 const INTERNAL_HEIGHT = 360;   // render resolution (width follows aspect ratio)
@@ -12,6 +13,11 @@ const DITHER_STRENGTH = 0.7;   // 0 = flat banding, 1 = full Bayer pattern
 const FOV_DEG         = 70;    // vertical FOV
 const SHOW_DEBUG      = true;  // small readout in the top right (position, velocity, keys)
 const MAX_FRAME_DT    = 0.1;   // clamp to avoid a spiral of death after a tab switch
+const BLAST_RADIUS_M  = 2.0;   // left click: crater radius in metres (a tile is 4 m wide)
+const BIG_BLAST_MUL   = 1.8;   // right click: bigger blast
+const BLAST_PUSH      = 13;    // m/s of knockback at point-blank range
+const FLASH_LIFE      = 0.9;   // seconds the explosion light lasts
+const FLASH_PEAK      = 14;    // explosion light intensity (braziers are 3, torch 2.2)
 
 // ---------------------------------------------------------------- renderer
 const canvas = document.getElementById('view');
@@ -56,9 +62,12 @@ const lightCol = Array.from({ length: MAX_LIGHTS }, () => new THREE.Vector3());
 const torchBase = new THREE.Vector3(1.0, 0.85, 0.6).multiplyScalar(2.2);
 const staticLights = world.lights.slice(0, MAX_LIGHTS - 1).map((l) => ({
   base: new THREE.Vector3(...l.color).multiplyScalar(l.intensity),
+  anchor: l.anchor,   // flame voxel; when an explosion removes it the light goes out
+  dead: false,
 }));
 world.lights.slice(0, MAX_LIGHTS - 1).forEach((l, i) => lightPos[i + 1].set(...l.pos));
-const lightCount = 1 + staticLights.length;
+const BASE_LIGHTS = 1 + staticLights.length;   // torch + braziers; slots after these are explosion flashes
+const lightCount = BASE_LIGHTS;
 
 const uniforms = {
   uVoxels:   { value: voxelTex },
@@ -109,13 +118,77 @@ resize();
 // ---------------------------------------------------------------- physics + player
 const physics = await createPhysics(world);   // collision mesh + Rapier world (a second or two)
 
+warmUp();   // JIT the explosion code on a scratch grid so the first real blast doesn't hitch
+
 const spawn = { x: (world.start.tx + 0.5) * TILE_M, y: 0, z: (world.start.tz + 0.5) * TILE_M };
 const player = new Player(physics, spawn);    // tweak the feel: new Player(physics, spawn, { walkSpeed: 5, jumpHeight: 1.3 })
 const input = new Input(canvas, { yaw: Math.PI / 2 });   // start facing down the first corridor (+X)
 
 const hint = document.getElementById('hint');
-if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · Esc release mouse';
+if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · Esc release mouse · Click: explode · Right click: big explosion';
 const debugEl = document.getElementById('debug');
+
+
+// ---------------------------------------------------------------- explosions
+// 1. explode() edits world.data (voxels + coarse grid) on the CPU
+// 2. the changed box is pushed to the GPU texture with texSubImage3D (not the whole 80 MB volume)
+// 3. physics.updateRegion() re-meshes only the collision chunks that changed
+function uploadVoxelBox(box) {
+  const glTex = renderer.properties.get(voxelTex).__webglTexture;
+  if (!glTex) { voxelTex.needsUpdate = true; return; }       // not on the GPU yet: the normal full upload covers it
+  const w = box.x1 - box.x0, h = box.y1 - box.y0, d = box.z1 - box.z0;
+  const buf = new Uint8Array(w * h * d);
+  const { x: sx, y: sy } = world.size;
+  let o = 0;
+  for (let z = box.z0; z < box.z1; z++) for (let y = box.y0; y < box.y1; y++) {
+    const row = box.x0 + sx * (y + sy * z);
+    buf.set(world.data.subarray(row, row + w), o);
+    o += w;
+  }
+  gl.bindTexture(gl.TEXTURE_3D, glTex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texSubImage3D(gl.TEXTURE_3D, 0, box.x0, box.y0, box.z0, w, h, d, gl.RED, gl.UNSIGNED_BYTE, buf);
+  renderer.resetState();                                      // three caches GL bindings; we changed one behind its back
+}
+
+const flashes = [];   // { pos: [x,y,z] voxels, t0 }
+
+function blast(radiusM) {
+  const { forward } = Player.basis(input.yaw, input.pitch);
+  player.eyeVoxels(eye);
+  const hit = raycastVoxels(world, [eye.x, eye.y, eye.z], forward);
+  if (!hit) return;
+
+  const R = radiusM * M2V;                                    // metres -> voxels
+  const c = hit.point.map((p, i) => p + hit.normal[i] * R * 0.3);   // nudge out of the wall so the crater opens into the room
+  const box = explode(world, c, R, {
+    keepClear: [{ x: mToVoxX(player.x), z: mToVoxZ(player.z), r: 0.9 * M2V }],   // no rubble under the player's feet
+  });
+  if (!box) return;
+
+  uploadVoxelBox(box);
+  coarseTex.needsUpdate = true;                               // 157 KB, cheap to re-upload whole
+  physics.updateRegion(box);
+
+  // braziers whose flame voxel was destroyed go out
+  staticLights.forEach((l) => { if (!l.dead && voxelAt(world, ...l.anchor) !== 6) l.dead = true; });
+
+  // light flash + knockback
+  flashes.push({ pos: c, t0: performance.now() / 1000, scale: radiusM / BLAST_RADIUS_M });
+  if (flashes.length > MAX_LIGHTS - BASE_LIGHTS) flashes.shift();
+
+  const px = mToVoxX(player.x), py = mToVoxY(player.y), pz = mToVoxZ(player.z);
+  let dx = px - c[0], dy = py - c[1], dz = pz - c[2];
+  const dist = Math.hypot(dx, dy, dz) / M2V;                  // metres
+  const reach = radiusM * 2.4;
+  if (dist < reach) {
+    const k = 1 - dist / reach;
+    const len = Math.hypot(dx, dy, dz) || 1;
+    dx /= len; dy /= len; dz /= len;
+    const s = BLAST_PUSH * k * Math.sqrt(radiusM / BLAST_RADIUS_M);
+    player.knock(dx * s, Math.max(dy, 0.35) * s, dz * s);
+  }
+}
 
 // ---------------------------------------------------------------- loop
 let last = performance.now();
@@ -135,6 +208,9 @@ function frame(now) {
     player.tick(input.sample());
     acc -= FIXED_DT;
   }
+  const fire = input.consumeFire();
+  if (fire) blast(BLAST_RADIUS_M * (fire === 2 ? BIG_BLAST_MUL : 1));
+
   player.alpha = acc / FIXED_DT;
   player.frameUpdate(dt);
 
@@ -164,8 +240,19 @@ function frame(now) {
   // flicker
   lightCol[0].copy(torchBase).multiplyScalar(1 + 0.02 * Math.sin(time * 9));
   staticLights.forEach((l, i) => {
-    lightCol[i + 1].copy(l.base).multiplyScalar(1 + 0.10 * Math.sin(time * 7 + i * 2.3) + 0.06 * Math.sin(time * 19 + i));
+    if (l.dead) lightCol[i + 1].set(0, 0, 0);
+    else lightCol[i + 1].copy(l.base).multiplyScalar(1 + 0.10 * Math.sin(time * 7 + i * 2.3) + 0.06 * Math.sin(time * 19 + i));
   });
+
+  // explosion flashes occupy the light slots after the torch and braziers
+  for (let i = flashes.length - 1; i >= 0; i--) if (time - flashes[i].t0 > FLASH_LIFE) flashes.splice(i, 1);
+  flashes.forEach((f, i) => {
+    const age = (time - f.t0) / FLASH_LIFE;
+    const e = Math.exp(-age * 5) * (1 - age) * FLASH_PEAK * f.scale;
+    lightPos[BASE_LIGHTS + i].set(...f.pos);
+    lightCol[BASE_LIGHTS + i].set(1.0, 0.62, 0.3).multiplyScalar(e);
+  });
+  uniforms.uLightCount.value = BASE_LIGHTS + flashes.length;
 
   if (SHOW_DEBUG && debugEl) {
     const fy = player.y - player.centreOffset;
