@@ -9,6 +9,7 @@ import { Particles, MAX_PARTICLES, TEXELS } from './particles.js';
 import { Projectiles } from './projectiles.js';
 import { DebugOverlay } from './debug.js';
 import { Minimap } from './minimap.js';
+import { LavaSim } from './lava.js';
 
 // ---------------------------------------------------------------- settings
 const INTERNAL_HEIGHT = 360;   // render resolution (width follows aspect ratio)
@@ -74,7 +75,7 @@ const solidVoxel = (x, y, z) => {
   return world.data[ix + world.size.x * (iy + world.size.y * iz)] !== 0;
 };
 
-const palette = Array.from({ length: 8 }, (_, i) => new THREE.Vector3(...(PALETTE[i] ?? [1, 0, 1])));
+const palette = Array.from({ length: 10 }, (_, i) => new THREE.Vector3(...(PALETTE[i] ?? [1, 0, 1])));
 
 // Lights: index 0 is the player's torch (follows the camera), the rest come from the world.
 const MAX_LIGHTS = 8;
@@ -87,7 +88,8 @@ const staticLights = world.lights.slice(0, MAX_LIGHTS - 1).map((l) => ({
   dead: false,
 }));
 world.lights.slice(0, MAX_LIGHTS - 1).forEach((l, i) => lightPos[i + 1].set(...l.pos));
-const BASE_LIGHTS = 1 + staticLights.length;   // torch + braziers; slots after these are explosion flashes
+const LAVA_LIGHT = 1 + staticLights.length;    // one light over the lava pool (centroid); see lava.light()
+const BASE_LIGHTS = LAVA_LIGHT + 1;            // torch + braziers + lava; slots after these are shells / explosion flashes
 const lightCount = BASE_LIGHTS;
 
 // Explosion particles live on the CPU; their packed state is uploaded as a small float texture
@@ -166,13 +168,13 @@ const mapCap = document.getElementById('mapcap');
 if (mapCap) mapCap.textContent = `SEED ${seed}`;
 
 const hint = document.getElementById('hint');
-if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · M map · F3 debug · Esc release mouse · Click: fire grenade · Right click: heavy shell (hold to keep firing)';
+if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · M map · F3 debug · Esc release mouse · L: pour lava at crosshair (Shift+L clear) · Click: fire grenade · Right click: heavy shell (hold to keep firing)';
 
 // ---------------------------------------------------------------- F3 debug overlay
 const stats = { shots: 0, blasts: 0, lastBlast: null };   // counters updated by shoot() / detonate()
 const GL_DEBUG = gl.getExtension('WEBGL_debug_renderer_info');
 const gpuName = GL_DEBUG ? gl.getParameter(GL_DEBUG.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
-const MATERIALS = ['air', 'stone', 'grass', 'dungeon floor', 'wood', 'brick', 'flame', 'scorched stone'];
+const MATERIALS = ['air', 'stone', 'grass', 'dungeon floor', 'wood', 'brick', 'flame', 'scorched stone', 'lava'];
 const COMPASS = ['N (-Z)', 'NE', 'E (+X)', 'SE', 'S (+Z)', 'SW', 'W (-X)', 'NW'];
 const debugEl = document.getElementById('debug');
 const debug = debugEl && new DebugOverlay(debugEl, () => {
@@ -261,6 +263,7 @@ function detonate(point, normal, radiusM) {
 
     // braziers whose flame voxel was destroyed go out
     staticLights.forEach((l) => { if (!l.dead && voxelAt(world, ...l.anchor) !== 6) l.dead = true; });
+    lava.notifyCarved(box);                                   // blasts can carve lava away / open new paths for it
   }
 
   stats.blasts++;
@@ -329,6 +332,27 @@ function shoot(shot) {
   gunKick = Math.max(gunKick, shot.kick);
   gunMuzzle = 1;
 }
+
+// ---------------------------------------------------------------- lava
+// LavaSim (lava.js) writes id-8 voxels into world.data; we push the changed box to the GPU like explosions do.
+const LAVA_STEP = 1 / 30;                 // sim ticks per second: 30
+const lava = new LavaSim(world, { cell: 2, width: 1, viscosity: 0.6, reach: 8, period: 15, passes: 15 });
+let lavaAcc = 0, lavaSeeded = false, lavaLightK = 0, lavaLightStr = 0;
+const lavaLightPos = new THREE.Vector3();
+
+function pourLava(pitch = input.pitch) {   // source 3 cells above whatever the crosshair hits, so it falls and pools
+  const { forward } = Player.basis(input.yaw, pitch);
+  player.eyeVoxels(eye);
+  const hit = raycastVoxels(world, [eye.x, eye.y, eye.z], forward, 60 * M2V);
+  if (!hit) return;
+  const p = hit.point.map((v, i) => v + hit.normal[i] * 1.5);
+  lava.addSource(p[0], p[1] + 5 * lava.C, p[2]);
+}
+addEventListener('keydown', (e) => {
+  if (e.code !== 'KeyL' || e.repeat) return;
+  if (e.shiftKey) { lava.clear(); const b = lava.flush(); if (b) { uploadVoxelBox(b); coarseTex.needsUpdate = true; } }
+  else pourLava();
+});
 
 // ---------------------------------------------------------------- loop
 let last = performance.now();
@@ -436,6 +460,23 @@ function frame(now) {
     lightCol[BASE_LIGHTS + i].set(1.0, 0.62 - 0.3 * age, 0.3 - 0.22 * age).multiplyScalar(e);
   });
   uniforms.uLightCount.value = BASE_LIGHTS + used + (flashes.length - firstFlash);
+
+  // lava: fixed-rate sim, upload the dirty box, light follows the pool
+  if (!lavaSeeded) { lavaSeeded = true; pourLava(-0.45); }   // a first pour ahead of the spawn so there is something to see
+  lavaAcc += dt;
+  for (let n = 0; lavaAcc >= LAVA_STEP && n < 3; n++) { lava.step(); lavaAcc -= LAVA_STEP; }
+  if (lavaAcc > LAVA_STEP * 3) lavaAcc = 0;
+  const lbox = lava.flush();
+  if (lbox) { uploadVoxelBox(lbox); coarseTex.needsUpdate = true; }
+  const ll = lava.light();
+  if (ll) {                                                   // smooth the light so the moving centroid / growing pool doesn't make it jump
+    const k = 1 - Math.exp(-4 * dt);
+    if (lavaLightK === 0) { lavaLightPos.set(...ll.pos); lavaLightStr = ll.strength; }
+    else { lavaLightPos.x += (ll.pos[0] - lavaLightPos.x) * k; lavaLightPos.y += (ll.pos[1] - lavaLightPos.y) * k; lavaLightPos.z += (ll.pos[2] - lavaLightPos.z) * k; lavaLightStr += (ll.strength - lavaLightStr) * k; }
+    lavaLightK = 1;
+    lightPos[LAVA_LIGHT].copy(lavaLightPos);
+    lightCol[LAVA_LIGHT].set(1.0, 0.38, 0.09).multiplyScalar(10.5 * (0.5 + 0.5 * lavaLightStr) * (1 + 0.03 * Math.sin(time * 2.1)));
+  } else { lightCol[LAVA_LIGHT].set(0, 0, 0); lavaLightK = 0; }
 
   // particles: simulate, pack, upload only while something is alive
   particles.update(dt);

@@ -26,7 +26,7 @@ uniform float uEmissive;    // brightness of emissive voxels (id == 6)
 uniform float uDither;      // dither strength: 0 = banding, 1 = full Bayer
 uniform float uInvScale;    // 4 / voxelsPerTile: converts voxel distances to the old unit scale
 uniform float uBlock;       // size (voxels) of the blocky colour-variation cells
-uniform vec3  uPalette[8];
+uniform vec3  uPalette[10];
 uniform vec3  uLightPos[8];
 uniform vec3  uLightCol[8]; // colour * intensity
 uniform int   uLightCount;
@@ -42,6 +42,7 @@ const int BRICK         = 8;
 const int MAX_COARSE    = 200;
 const int SHADOW_COARSE = 100;
 const int EMISSIVE_ID   = 6;
+const int LAVA_ID       = 8;
 
 // ------------------------------------------------------------ helpers
 int voxelAt(ivec3 p) {
@@ -51,7 +52,9 @@ bool inBounds(ivec3 c) {
   return all(greaterThanEqual(c, ivec3(0))) && all(lessThan(c, ivec3(uSize)));
 }
 bool solidAt(ivec3 c) {
-  return inBounds(c) && voxelAt(c) > 0;
+  if (!inBounds(c)) return false;
+  int id = voxelAt(c);
+  return id > 0 && id != 8;      // lava never occludes ambient (AO) or the never-aim-into-stone check
 }
 
 float hash13(vec3 p) {
@@ -135,9 +138,17 @@ Hit trace(vec3 ro, vec3 rd, int maxCoarse, float maxT) {
   return noHit();
 }
 
+// Lava glows, it doesn't block light: shadow rays step through it (a few voxels at a time) and keep going.
 bool occluded(vec3 ro, vec3 rd, float dist) {
-  Hit h = trace(ro, rd, SHADOW_COARSE, dist);
-  return h.hit && h.t < dist;
+  float t0 = 0.0;
+  for (int k = 0; k < 6; k++) {
+    Hit h = trace(ro + rd * t0, rd, SHADOW_COARSE, dist - t0);
+    if (!h.hit || h.t >= dist - t0) return false;
+    if (h.id != LAVA_ID) return true;
+    t0 += h.t + 1.0;
+    if (t0 >= dist) return false;
+  }
+  return false;
 }
 
 // ------------------------------------------------------------ surface
@@ -208,8 +219,36 @@ vec3 lightSurface(vec3 p, vec3 n, vec3 alb, float ao) {
   return lit;
 }
 
+
+// Lava: emissive like the braziers, but with slow drifting hot/cool blotches (value noise in voxel blocks)
+// so it reads as molten rock with a darker crust rather than a flat orange slab. Hot cells go yellow-white.
+float lavaNoise(vec3 p) {
+  vec3 c = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  float a = hash13(c),                  b = hash13(c + vec3(1, 0, 0));
+  float cc = hash13(c + vec3(0, 1, 0)), d = hash13(c + vec3(1, 1, 0));
+  float e = hash13(c + vec3(0, 0, 1)),  g = hash13(c + vec3(1, 0, 1));
+  float h = hash13(c + vec3(0, 1, 1)),  i = hash13(c + vec3(1, 1, 1));
+  return mix(mix(mix(a, b, f.x), mix(cc, d, f.x), f.y), mix(mix(e, g, f.x), mix(h, i, f.x), f.y), f.z);
+}
+// All animation is smooth (time is a continuous noise axis, no stepped hashes), so nothing pops or flickers.
+vec3 shadeLava(Hit h, vec3 p) {
+  float s = uBlock * 3.0;                                              // blotch size in voxels
+  vec3  q = vec3(p.x, p.z, uTime * 0.12 * s) / s;                      // world XZ only: a cell looks the same at any height / on any face
+  float n = 0.6 * lavaNoise(q) + 0.4 * lavaNoise(q * 2.3 + 11.0);
+  float heat = smoothstep(0.22, 0.65, n);
+  vec3 crust = vec3(0.50, 0.08, 0.02);
+  vec3 hot   = vec3(1.00, 0.45, 0.08);
+  vec3 white = vec3(1.00, 0.88, 0.45);
+  vec3 c = mix(crust, hot, heat);
+  c = mix(c, white, smoothstep(0.65, 0.95, n) * 0.85);
+  return c * 0.75 * (0.9 + uEmissive * 1.6 * heat);
+}
+
 vec3 shade(Hit h, vec3 ro, vec3 rd) {
   vec3 p = ro + rd * h.t;
+
+  if (h.id == LAVA_ID) return shadeLava(h, p);
 
   if (h.id == EMISSIVE_ID) {
     float fl = 0.85 + 0.3 * hash13(floor(vec3(h.cell) / uBlock) + floor(uTime * 8.0));

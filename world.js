@@ -22,6 +22,7 @@ export const PALETTE = [
   [0.55, 0.14, 0.10], // 5 brick
   [1.00, 0.60, 0.20], // 6 emissive flame
   [0.13, 0.115, 0.105], // 7 scorched stone (explosion soot)
+  [1.00, 0.34, 0.06], // 8 lava (emissive, animated in shader.js; simulated in lava.js)
 ];
 
 // ---------------------------------------------------------------- procedural layout

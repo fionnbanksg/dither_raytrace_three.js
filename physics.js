@@ -18,6 +18,7 @@ export const CELL = CELL_VOX * VOX;            // 0.25 m
 export const FIXED_DT = 1 / 60;                // physics tick
 
 const GRASS = 2;
+const LAVA = 8;   // lava voxels are walk-through for now (damage/wading would hook in here)
 
 // ---------------------------------------------------------------- solid cell grid
 function cellIsSolid(world, cx, cy, cz) {
@@ -30,7 +31,7 @@ function cellIsSolid(world, cx, cy, cz) {
       for (let x = cx * CELL_VOX; x < cx * CELL_VOX + CELL_VOX; x++) {
         if (x >= sx || y >= sy || z >= sz) { count++; continue; }   // outside the world counts as stone
         const id = data[x + sx * (y + sy * z)];
-        if (id !== 0 && id !== GRASS) count++;                      // grass above the floor is walk-through
+        if (id !== 0 && id !== GRASS && id !== LAVA) count++;                      // grass above the floor is walk-through
       }
     }
   }
