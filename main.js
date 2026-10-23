@@ -6,6 +6,7 @@ import { Input } from './input.js';
 import { createPhysics, FIXED_DT, TILE_M, M2V, mToVoxX, mToVoxY, mToVoxZ } from './physics.js';
 import { explode, raycastVoxels, voxelAt, warmUp } from './destruction.js';
 import { Particles, MAX_PARTICLES, TEXELS } from './particles.js';
+import { Projectiles } from './projectiles.js';
 
 // ---------------------------------------------------------------- settings
 const INTERNAL_HEIGHT = 360;   // render resolution (width follows aspect ratio)
@@ -21,6 +22,15 @@ const FLASH_LIFE      = 1.4;   // seconds the explosion light lasts (it lingers 
 const FLASH_PEAK      = 14;    // explosion light intensity (braziers are 3, torch 2.2)
 const SHAKE_AMOUNT    = 1.0;   // camera shake strength for a nearby blast (0 = off)
 const DEBRIS_PER_BLAST = 56;   // chunks of the destroyed material thrown out (max)
+
+// gun: left click = grenade, right click = heavy shell (slower, bigger, drops more). Hold to keep firing.
+const SHOTS = {
+  small: { speed: 34, gravity: 6.0, radiusM: BLAST_RADIUS_M,                 cooldown: 0.32, kick: 1.0, big: false },
+  big:   { speed: 22, gravity: 6.0, radiusM: BLAST_RADIUS_M * BIG_BLAST_MUL, cooldown: 0.90, kick: 1.8, big: true  },
+};
+const INHERIT_VELOCITY = 1.0;  // fraction of the player's own velocity added to the shot
+const AIM_CONVERGE_M   = 40;   // the barrel is off-centre, so shots are aimed at what the crosshair sees (up to this far)
+const GUN_TIP = [4.8, -4.2, 24];   // muzzle position in camera space (voxels): x right, y up, z forward
 
 // ---------------------------------------------------------------- renderer
 const canvas = document.getElementById('view');
@@ -103,6 +113,8 @@ const uniforms = {
   uLightCount: { value: lightCount },
   uPalette:  { value: palette },
   uParticles: { value: particleTex },
+  uGunOff: { value: new THREE.Vector3() },
+  uMuzzle: { value: 0 },
   uParticleCount: { value: 0 },
   uPBound: { value: new THREE.Vector4() },
 };
@@ -139,7 +151,7 @@ const player = new Player(physics, spawn);    // tweak the feel: new Player(phys
 const input = new Input(canvas, { yaw: Math.PI / 2 });   // start facing down the first corridor (+X)
 
 const hint = document.getElementById('hint');
-if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · Esc release mouse · Click: explode · Right click: big explosion';
+if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · Esc release mouse · Click: fire grenade · Right click: heavy shell (hold to keep firing)';
 const debugEl = document.getElementById('debug');
 
 
@@ -167,29 +179,27 @@ function uploadVoxelBox(box) {
 
 const flashes = [];   // { pos: [x,y,z] voxels, t0 }
 
-function blast(radiusM) {
-  const { forward } = Player.basis(input.yaw, input.pitch);
-  player.eyeVoxels(eye);
-  const hit = raycastVoxels(world, [eye.x, eye.y, eye.z], forward);
-  if (!hit) return;
-
+// Carve the crater, throw particles, flash the lights, knock the player back.
+// point / normal: where the shell hit (voxels). normal = [0,0,0] means an airburst.
+function detonate(point, normal, radiusM) {
   const R = radiusM * M2V;                                    // metres -> voxels
-  const c = hit.point.map((p, i) => p + hit.normal[i] * R * 0.3);   // nudge out of the wall so the crater opens into the room
+  const c = point.map((p, i) => p + normal[i] * R * 0.3);     // nudge out of the wall so the crater opens into the room
   const debris = [];
   const box = explode(world, c, R, {
     keepClear: [{ x: mToVoxX(player.x), z: mToVoxZ(player.z), r: 0.9 * M2V }],   // no rubble under the player's feet
     debrisOut: debris, debrisMax: DEBRIS_PER_BLAST,
   });
-  if (!box) return;
 
-  particles.burst(c, hit.normal, radiusM / BLAST_RADIUS_M, debris);
+  if (box) {
+    uploadVoxelBox(box);
+    coarseTex.needsUpdate = true;                             // 157 KB, cheap to re-upload whole
+    physics.updateRegion(box);
 
-  uploadVoxelBox(box);
-  coarseTex.needsUpdate = true;                               // 157 KB, cheap to re-upload whole
-  physics.updateRegion(box);
+    // braziers whose flame voxel was destroyed go out
+    staticLights.forEach((l) => { if (!l.dead && voxelAt(world, ...l.anchor) !== 6) l.dead = true; });
+  }
 
-  // braziers whose flame voxel was destroyed go out
-  staticLights.forEach((l) => { if (!l.dead && voxelAt(world, ...l.anchor) !== 6) l.dead = true; });
+  particles.burst(c, normal[0] || normal[1] || normal[2] ? normal : [0, 1, 0], radiusM / BLAST_RADIUS_M, debris);
 
   // light flash + knockback
   flashes.push({ pos: c, t0: performance.now() / 1000, scale: radiusM / BLAST_RADIUS_M });
@@ -207,6 +217,51 @@ function blast(radiusM) {
     player.knock(dx * s, Math.max(dy, 0.35) * s, dz * s);
   }
   shake = Math.max(shake, SHAKE_AMOUNT * Math.min(1, Math.sqrt(radiusM / BLAST_RADIUS_M)) * Math.max(0, 1 - dist / (radiusM * 6)));
+}
+
+// ---------------------------------------------------------------- gun + projectiles
+const projectiles = new Projectiles(world, {
+  onImpact: ({ point, normal, radiusM }) => detonate(point, normal, radiusM),
+  onTrail: (x, y, z, big) => particles.trail(x, y, z, big),
+});
+
+let gunCooldown = 0;
+let gunKick = 0, gunMuzzle = 0;                               // recoil + muzzle flash, both decay after a shot
+let bobPhase = 0, bobAmt = 0;
+const sway = { x: 0, y: 0 };
+let lastYaw = 0, lastPitch = 0;
+
+function shoot(shot) {
+  const { forward, right, up } = Player.basis(input.yaw, input.pitch);
+  player.eyeVoxels(eye);
+
+  // muzzle position in the world
+  const barrel = [0, 1, 2].map((i) => eye.getComponent(i) + right[i] * GUN_TIP[0] + up[i] * GUN_TIP[1] + forward[i] * GUN_TIP[2]);
+
+  // the barrel sits off to the side, so aim at whatever the crosshair is on (or a far point if it sees nothing close)
+  const crosshair = raycastVoxels(world, [eye.x, eye.y, eye.z], forward, AIM_CONVERGE_M * M2V);
+  const aimDist = crosshair ? Math.max(crosshair.t, 12) : AIM_CONVERGE_M * M2V;
+  const target = [eye.x + forward[0] * aimDist, eye.y + forward[1] * aimDist, eye.z + forward[2] * aimDist];
+  let dir = [target[0] - barrel[0], target[1] - barrel[1], target[2] - barrel[2]];
+  const dl = Math.hypot(...dir) || 1;
+  dir = dir.map((v) => v / dl);
+
+  // if the barrel is poking into a wall, fire from the eye instead (the shell will blow up right in front of you)
+  let start = barrel;
+  const toBarrel = [barrel[0] - eye.x, barrel[1] - eye.y, barrel[2] - eye.z];
+  const bl = Math.hypot(...toBarrel) || 1;
+  if (raycastVoxels(world, [eye.x, eye.y, eye.z], toBarrel.map((v) => v / bl), bl)) start = [eye.x, eye.y, eye.z];
+
+  const sp = shot.speed * M2V;
+  projectiles.spawn(start, [
+    dir[0] * sp + player.vx * M2V * INHERIT_VELOCITY,
+    dir[1] * sp + player.vy * M2V * INHERIT_VELOCITY,
+    dir[2] * sp + player.vz * M2V * INHERIT_VELOCITY,
+  ], { gravity: shot.gravity * M2V, radiusM: shot.radiusM, big: shot.big });
+
+  gunCooldown = shot.cooldown;
+  gunKick = Math.max(gunKick, shot.kick);
+  gunMuzzle = 1;
 }
 
 // ---------------------------------------------------------------- loop
@@ -227,10 +282,12 @@ function frame(now) {
   acc += dt;
   while (acc >= FIXED_DT) {
     player.tick(input.sample());
+    projectiles.update(FIXED_DT);
     acc -= FIXED_DT;
   }
-  const fire = input.consumeFire();
-  if (fire) blast(BLAST_RADIUS_M * (fire === 2 ? BIG_BLAST_MUL : 1));
+  const fire = input.consumeFire() || input.fireHeld;
+  gunCooldown -= dt;
+  if (fire && gunCooldown <= 0 && input.locked) shoot(fire === 2 ? SHOTS.big : SHOTS.small);
 
   player.alpha = acc / FIXED_DT;
   player.frameUpdate(dt);
@@ -273,9 +330,36 @@ function frame(now) {
     else lightCol[i + 1].copy(l.base).multiplyScalar(1 + 0.10 * Math.sin(time * 7 + i * 2.3) + 0.06 * Math.sin(time * 19 + i));
   });
 
+  // gun animation: recoil kick, walking bob, and lag when you turn
+  gunKick *= Math.exp(-11 * dt);
+  gunMuzzle *= Math.exp(-22 * dt);
+  const speed = player.onGround && !player.fly ? Math.hypot(player.vx, player.vz) : 0;
+  bobAmt += (Math.min(1, speed / 5) - bobAmt) * (1 - Math.exp(-8 * dt));
+  bobPhase += speed * dt * 1.7;
+  const dyaw = input.yaw - lastYaw, dpitch = input.pitch - lastPitch;
+  lastYaw = input.yaw; lastPitch = input.pitch;
+  sway.x = Math.max(-2, Math.min(2, sway.x - dyaw * 18)) * Math.exp(-9 * dt);
+  sway.y = Math.max(-2, Math.min(2, sway.y - dpitch * 18)) * Math.exp(-9 * dt);
+  uniforms.uGunOff.value.set(
+    Math.sin(bobPhase) * 0.35 * bobAmt + sway.x,
+    -Math.abs(Math.cos(bobPhase)) * 0.45 * bobAmt + Math.sin(time * 1.3) * 0.05 + 0.9 * gunKick + sway.y,
+    -3.0 * gunKick);
+  uniforms.uMuzzle.value = gunMuzzle > 0.03 ? gunMuzzle : 0;
+
+  // glowing shells light the corridor as they fly (up to two), explosion flashes fill the remaining slots
+  const dynSlots = MAX_LIGHTS - BASE_LIGHTS;
+  let used = 0;
+  for (let i = 0; i < projectiles.list.length && used < Math.min(2, dynSlots); i++, used++) {
+    const pp = projectiles.interpolated(acc / FIXED_DT, i);
+    lightPos[BASE_LIGHTS + used].set(pp[0], pp[1], pp[2]);
+    lightCol[BASE_LIGHTS + used].set(1.0, 0.6, 0.25).multiplyScalar((projectiles.list[i].big ? 3.4 : 2.4) * (1 + 0.2 * Math.sin(time * 40 + i)));
+  }
+
   // explosion flashes occupy the light slots after the torch and braziers
   for (let i = flashes.length - 1; i >= 0; i--) if (time - flashes[i].t0 > FLASH_LIFE) flashes.splice(i, 1);
-  flashes.forEach((f, i) => {
+  const firstFlash = Math.max(0, flashes.length - (dynSlots - used));
+  flashes.slice(firstFlash).forEach((f, i0) => {
+    const i = i0 + used;
     const age = (time - f.t0) / FLASH_LIFE;
     const flick = 1 + 0.25 * Math.sin(time * 31 + i * 5.1) + 0.15 * Math.sin(time * 53 + i);
     const e = (0.75 * Math.exp(-age * 5) + 0.25 * Math.exp(-age * 1.6)) * (1 - age) * FLASH_PEAK * f.scale * flick;
@@ -283,16 +367,17 @@ function frame(now) {
     // white-orange at the start, cooling to red
     lightCol[BASE_LIGHTS + i].set(1.0, 0.62 - 0.3 * age, 0.3 - 0.22 * age).multiplyScalar(e);
   });
-  uniforms.uLightCount.value = BASE_LIGHTS + flashes.length;
+  uniforms.uLightCount.value = BASE_LIGHTS + used + (flashes.length - firstFlash);
 
   // particles: simulate, pack, upload only while something is alive
   particles.update(dt);
-  if (particles.count > 0 || particlesLive) {
-    particles.pack();
+  const shells = projectiles.cubes(acc / FIXED_DT);
+  if (particles.count > 0 || shells.length > 0 || particlesLive) {
+    particles.pack(shells);
     uniforms.uParticleCount.value = particles.packed;
     uniforms.uPBound.value.set(...particles.bound);
     particleTex.needsUpdate = true;
-    particlesLive = particles.count > 0;
+    particlesLive = particles.count > 0 || shells.length > 0;
   }
 
   if (SHOW_DEBUG && debugEl) {

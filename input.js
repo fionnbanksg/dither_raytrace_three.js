@@ -13,6 +13,7 @@ export class Input {
     this.keys = new Set();
     this._jumpPressed = false;
     this._toggleFly = false;
+    this.fireHeld = 0;                            // 1 / 2 while the left / right button is held
     this._fire = 0;                               // 1 = left click, 2 = right click (only while the mouse is captured)
 
     const block = new Set(['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'ControlLeft', 'Tab']);
@@ -25,15 +26,18 @@ export class Input {
       if (e.code === 'KeyF') this._toggleFly = true;
     });
     addEventListener('keyup', (e) => this.keys.delete(e.code));
-    addEventListener('blur', () => this.keys.clear());
+    addEventListener('blur', () => { this.keys.clear(); this.fireHeld = 0; });
 
     canvas.addEventListener('click', () => {
       if (document.pointerLockElement !== canvas) canvas.requestPointerLock?.();
     });
     canvas.addEventListener('mousedown', (e) => {
       if (document.pointerLockElement !== canvas) return;   // the click that captures the mouse doesn't fire
-      if (e.button === 0) this._fire = 1;
-      else if (e.button === 2) this._fire = 2;
+      if (e.button === 0) this._fire = this.fireHeld = 1;
+      else if (e.button === 2) this._fire = this.fireHeld = 2;
+    });
+    addEventListener('mouseup', (e) => {
+      if ((e.button === 0 && this.fireHeld === 1) || (e.button === 2 && this.fireHeld === 2)) this.fireHeld = 0;
     });
     canvas.addEventListener('contextmenu', (e) => e.preventDefault());
     addEventListener('mousemove', (e) => {

@@ -32,6 +32,8 @@ uniform vec3  uLightCol[8]; // colour * intensity
 uniform int   uLightCount;
 uniform sampler2D uParticles;   // 3 texels x N rows, see particles.js
 uniform int   uParticleCount;   // live voxel-cube particles
+uniform vec3  uGunOff;          // viewmodel offset in camera space (recoil, bob, sway)
+uniform float uMuzzle;          // muzzle flash 0..1
 uniform vec4  uPBound;          // bounding sphere of all particles (xyz, r): rays that miss it skip the loop
 
 layout(location = 0) out highp vec4 fragColor;
@@ -271,6 +273,71 @@ vec3 shadeParticle(int i, vec3 ro, vec3 rd, float t, vec3 n) {
   return col;
 }
 
+// ------------------------------------------------------------ gun viewmodel
+// A blocky launcher fixed in camera space (x right, y up, z forward, in voxels), drawn over the scene.
+// Boxes: 0 receiver, 1 barrel, 2 muzzle ring, 3 grip, 4 sight rail, 5 glowing energy cell, 6 foregrip.
+const int GUN_BOXES = 7;
+const vec3 GUN_MIN[7] = vec3[7](
+  vec3(3.6, -5.4,  7.0), vec3(4.1, -5.0, 17.0), vec3(3.9, -5.2, 22.5), vec3(4.1, -8.2,  8.0),
+  vec3(4.5, -3.2,  9.0), vec3(3.5, -4.7,  9.5), vec3(4.3, -6.4, 13.0));
+const vec3 GUN_MAX[7] = vec3[7](
+  vec3(6.0, -3.2, 17.0), vec3(5.7, -3.4, 23.5), vec3(5.9, -3.2, 24.0), vec3(5.4, -5.4, 10.8),
+  vec3(5.2, -2.6, 15.0), vec3(3.62, -3.9, 15.5), vec3(5.3, -5.4, 15.5));
+const vec3 GUN_COL[7] = vec3[7](
+  vec3(0.17, 0.18, 0.21), vec3(0.11, 0.11, 0.13), vec3(0.28, 0.27, 0.30), vec3(0.30, 0.16, 0.07),
+  vec3(0.24, 0.24, 0.27), vec3(0.02, 0.02, 0.02), vec3(0.30, 0.16, 0.07));
+
+// returns box index (0..6), 7 = muzzle flash, -1 = none
+int traceGun(vec3 rdc, out float tBest, out vec3 nBest) {
+  tBest = 1e9; nBest = vec3(0.0);
+  int best = -1;
+  vec3 inv = 1.0 / (rdc + vec3(1e-6));
+  for (int i = 0; i < 8; i++) {
+    vec3 bmin, bmax;
+    if (i < GUN_BOXES) {
+      bmin = GUN_MIN[i] + uGunOff; bmax = GUN_MAX[i] + uGunOff;
+    } else {
+      if (uMuzzle < 0.03) break;
+      bmin = vec3(3.5, -5.5, 24.0) + uGunOff;
+      bmax = vec3(6.1, -2.9, 24.0 + 6.0 * uMuzzle) + uGunOff;
+    }
+    vec3 t0 = bmin * inv, t1 = bmax * inv;
+    vec3 tmn = min(t0, t1), tmx = max(t0, t1);
+    float tn = max(max(tmn.x, tmn.y), tmn.z);
+    float tf = min(min(tmx.x, tmx.y), tmx.z);
+    if (tn <= 0.0 || tn >= tBest || tf < tn) continue;
+    vec3 n = -sign(rdc) * step(tmn.yzx, tmn) * step(tmn.zxy, tmn);
+    if (i == 7) {                                                   // muzzle flash: voxels pop out as it fades
+      vec3 c = floor((rdc * tn - n * 0.1) * 1.2);
+      if (hash13(c + floor(uTime * 30.0)) > uMuzzle) continue;
+    }
+    tBest = tn; nBest = n; best = i;
+  }
+  return best;
+}
+
+vec3 shadeGun(int i, vec3 rdc, float t, vec3 nc) {
+  vec3 pc = rdc * t;
+  vec3 pw = uCamPos + uCamRight * pc.x + uCamUp * pc.y + uCamFwd * pc.z;
+  vec3 nw = uCamRight * nc.x + uCamUp * nc.y + uCamFwd * nc.z;
+  float v = 0.88 + 0.24 * hash13(floor((pc - nc * 0.1) * 1.6) + float(i) * 17.0);   // chunky per-voxel grit
+
+  if (i == 7) return vec3(2.6, 1.9, 0.9) * (0.8 + 0.4 * v);          // muzzle flash
+
+  vec3 alb = GUN_COL[i] * v;
+  vec3 lit = alb * 0.32;                                              // fill so it never goes fully black
+  for (int k = 0; k < 8; k++) {
+    if (k >= uLightCount) break;
+    vec3  L = uLightPos[k] - pw;
+    float d = length(L);
+    float du = d * uInvScale;
+    lit += alb * uLightCol[k] * max(dot(nw, L / d), 0.0) / (1.0 + 0.07 * du * du);
+  }
+  lit += alb * vec3(1.0, 0.55, 0.2) * uMuzzle * 1.5;                  // muzzle flash lights the barrel
+  if (i == 5) lit += vec3(1.0, 0.45, 0.1) * (1.1 + 0.3 * sin(uTime * 5.0) + uMuzzle) * v;   // energy cell
+  return lit;
+}
+
 // ------------------------------------------------------------ main
 void main() {
   vec2 uv = (gl_FragCoord.xy / uRes) * 2.0 - 1.0;
@@ -292,6 +359,12 @@ void main() {
   if (traceParticles(ro, rd, h.hit ? h.t : 1e9, pt, pn, pi)) {
     col = shadeParticle(pi, ro, rd, pt, pn) * exp(-pt * uInvScale * 0.03);
   }
+
+  // viewmodel on top
+  vec3 rdc = vec3(dot(rd, uCamRight), dot(rd, uCamUp), dot(rd, uCamFwd));
+  float gt; vec3 gn;
+  int gi = traceGun(rdc, gt, gn);
+  if (gi >= 0) col = shadeGun(gi, rdc, gt, gn);
 
   // tone + ordered dither
   col = pow(max(col, 0.0), vec3(0.6));

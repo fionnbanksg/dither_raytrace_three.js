@@ -14,6 +14,7 @@ import { PALETTE } from './world.js';
 
 export const MAX_PARTICLES = 768;
 export const TEXELS = 3;
+const EXTRA_SLOTS = 8;                       // room left over for cubes main.js hands to pack() (projectiles)
 
 const rnd = (a = 0, b = 1) => a + Math.random() * (b - a);
 const clamp01 = (v) => Math.min(1, Math.max(0, v));
@@ -59,7 +60,7 @@ export class Particles {
   get count() { return this.list.length; }
 
   _add(p) {
-    if (this.list.length >= MAX_PARTICLES) this.list.shift();   // drop the oldest
+    if (this.list.length >= MAX_PARTICLES - EXTRA_SLOTS) this.list.shift();   // drop the oldest
     this.list.push(p);
   }
 
@@ -137,6 +138,24 @@ export class Particles {
     }
   }
 
+  // one puff of exhaust at a point: a short-lived flame cube and (usually) a wisp of smoke
+  trail(x, y, z, big = false) {
+    const M = this.m2v, k = big ? 1.4 : 1;
+    const fl = rnd(0.12, 0.24);
+    this._add({
+      kind: 'fire', x, y, z, vx: rnd(-1, 1) * 0.6 * M, vy: rnd(0, 1) * 0.5 * M, vz: rnd(-1, 1) * 0.6 * M,
+      size0: rnd(1.5, 3) * k, grow: 0, fl, life: fl + rnd(0.15, 0.3), age: 0, heat0: rnd(0.8, 1),
+      drag: 2, grav: -1.5 * M, bounce: 0, shade: 1, seed: Math.random(),
+    });
+    if (Math.random() < 0.6) {
+      this._add({
+        kind: 'smoke', x, y, z, vx: rnd(-1, 1) * 0.5 * M, vy: rnd(0, 1) * 0.6 * M, vz: rnd(-1, 1) * 0.5 * M,
+        size0: rnd(2, 3.5) * k, grow: rnd(0.8, 1.4), fl: 0, life: rnd(0.7, 1.3), age: 0, heat0: 0, alpha0: 0.3,
+        drag: 1.2, grav: -1.0 * M, turb: 4 * M, bounce: 0, shade: rnd(0.8, 1.3), seed: Math.random(),
+      });
+    }
+  }
+
   update(dt) {
     const solid = this.solid;
     const L = this.list;
@@ -182,7 +201,8 @@ export class Particles {
   }
 
   // write live cubes into this.data (snapped to the voxel lattice) and compute the bounding sphere
-  pack() {
+  // extras: [{ x, y, z, half, ar, ag, ab, alpha, er, eg, eb, seed }] cubes that are already on the lattice
+  pack(extras = []) {
     const D = this.data, em = this._c;
     let n = 0;
     let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
@@ -233,6 +253,17 @@ export class Particles {
 
       if (mx < x0) x0 = mx; if (my < y0) y0 = my; if (mz < z0) z0 = mz;
       if (mx + edge > x1) x1 = mx + edge; if (my + edge > y1) y1 = my + edge; if (mz + edge > z1) z1 = mz + edge;
+    }
+    for (const e of extras) {
+      if (n >= MAX_PARTICLES) break;
+      const o = n * TEXELS * 4;
+      D[o] = e.x; D[o + 1] = e.y; D[o + 2] = e.z; D[o + 3] = e.half;
+      D[o + 4] = e.ar; D[o + 5] = e.ag; D[o + 6] = e.ab; D[o + 7] = e.alpha;
+      D[o + 8] = e.er; D[o + 9] = e.eg; D[o + 10] = e.eb; D[o + 11] = e.seed;
+      n++;
+      const h = e.half;
+      if (e.x - h < x0) x0 = e.x - h; if (e.y - h < y0) y0 = e.y - h; if (e.z - h < z0) z0 = e.z - h;
+      if (e.x + h > x1) x1 = e.x + h; if (e.y + h > y1) y1 = e.y + h; if (e.z + h > z1) z1 = e.z + h;
     }
     this.packed = n;
     if (n === 0) { this.bound[3] = 0; return; }
