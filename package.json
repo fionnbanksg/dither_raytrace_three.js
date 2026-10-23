@@ -1,0 +1,26 @@
+{
+  "name": "dither-vox",
+  "version": "1.0.0",
+  "description": "",
+  "main": "main.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fionnbanksg/dither_raytrace_three.js.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/fionnbanksg/dither_raytrace_three.js/issues"
+  },
+  "homepage": "https://github.com/fionnbanksg/dither_raytrace_three.js#readme",
+  "dependencies": {
+    "three": "^0.186.1"
+  },
+  "devDependencies": {
+    "vite": "^8.3.5"
+  }
+}

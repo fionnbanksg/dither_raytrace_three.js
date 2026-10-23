@@ -1,13 +1,14 @@
 import * as THREE from 'three';
-import { buildWorld, PALETTE, T, EYE_Y, isWalkable } from './world.js';
+import { buildWorld, PALETTE, T } from './world.js';
 import { vert, frag } from './shader.js';
+import { Player } from './player.js';
 
 // ---------------------------------------------------------------- settings
-const INTERNAL_HEIGHT = 240;   // render resolution (width follows aspect ratio)
-const DITHER_LEVELS   = 5;     // colour levels per channel (lower = grittier)
-const FOV_DEG         = 62;    // vertical FOV
-const MOVE_TIME       = 0.22;  // seconds per tile step
-const TURN_TIME       = 0.18;  // seconds per 90 degree turn
+const INTERNAL_HEIGHT = 360;   // render resolution (width follows aspect ratio)
+const DITHER_LEVELS   = 14;    // colour levels per channel (lower = grittier)
+const DITHER_STRENGTH = 0.7;   // 0 = flat banding, 1 = full Bayer pattern
+const FOV_DEG         = 70;    // vertical FOV
+const SHOW_DEBUG      = true;  // small readout in the top right (position, velocity, keys)
 
 // ---------------------------------------------------------------- renderer
 const canvas = document.getElementById('view');
@@ -23,19 +24,54 @@ voxelTex.minFilter = voxelTex.magFilter = THREE.NearestFilter;
 voxelTex.unpackAlignment = 1;
 voxelTex.needsUpdate = true;   // set again after editing world.data at runtime
 
+// coarse occupancy grid (8^3 bricks) used by the shader to skip empty space
+const coarseTex = new THREE.Data3DTexture(world.coarse, world.coarseSize.x, world.coarseSize.y, world.coarseSize.z);
+coarseTex.format = THREE.RedFormat;
+coarseTex.type = THREE.UnsignedByteType;
+coarseTex.minFilter = coarseTex.magFilter = THREE.NearestFilter;
+coarseTex.unpackAlignment = 1;
+coarseTex.needsUpdate = true;   // set again (and rebuild world.coarse) after editing voxels
+
+const gl = renderer.getContext();
+const maxTex3D = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE);
+if (Math.max(world.size.x, world.size.y, world.size.z) > maxTex3D) {
+  console.warn(`World is ${world.size.x}x${world.size.y}x${world.size.z} but this GPU's max 3D texture size is ${maxTex3D}. Lower T in world.js.`);
+}
+
 const palette = Array.from({ length: 8 }, (_, i) => new THREE.Vector3(...(PALETTE[i] ?? [1, 0, 1])));
+
+// Lights: index 0 is the player's torch (follows the camera), the rest come from the world.
+const MAX_LIGHTS = 8;
+const lightPos = Array.from({ length: MAX_LIGHTS }, () => new THREE.Vector3());
+const lightCol = Array.from({ length: MAX_LIGHTS }, () => new THREE.Vector3());
+const torchBase = new THREE.Vector3(1.0, 0.85, 0.6).multiplyScalar(2.2);
+const staticLights = world.lights.slice(0, MAX_LIGHTS - 1).map((l) => ({
+  base: new THREE.Vector3(...l.color).multiplyScalar(l.intensity),
+}));
+world.lights.slice(0, MAX_LIGHTS - 1).forEach((l, i) => lightPos[i + 1].set(...l.pos));
+const lightCount = 1 + staticLights.length;
 
 const uniforms = {
   uVoxels:   { value: voxelTex },
+  uCoarse:   { value: coarseTex },
+  uBlock:    { value: T / 16 },    // blocky colour-variation cell size in voxels
   uSize:     { value: new THREE.Vector3(world.size.x, world.size.y, world.size.z) },
   uCamPos:   { value: new THREE.Vector3() },
   uCamFwd:   { value: new THREE.Vector3(0, 0, -1) },
   uCamRight: { value: new THREE.Vector3(1, 0, 0) },
+  uCamUp:    { value: new THREE.Vector3(0, 1, 0) },
   uRes:      { value: new THREE.Vector2(1, 1) },
   uTanHalf:  { value: Math.tan(THREE.MathUtils.degToRad(FOV_DEG) / 2) },
   uTime:     { value: 0 },
   uLevels:   { value: DITHER_LEVELS },
-  uTorch:    { value: 1.6 },
+  uAmbient:  { value: 0.07 },
+  uSoft:     { value: 0.8 * (T / 4) },  // soft-shadow jitter radius in voxels (0 = hard shadows)
+  uEmissive: { value: 1.4 },
+  uDither:   { value: DITHER_STRENGTH },
+  uInvScale: { value: 4 / T },
+  uLightPos:   { value: lightPos },
+  uLightCol:   { value: lightCol },
+  uLightCount: { value: lightCount },
   uPalette:  { value: palette },
 };
 
@@ -61,100 +97,55 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
-// ---------------------------------------------------------------- party movement (grid based)
-const DIRS = [[0, -1], [1, 0], [0, 1], [-1, 0]]; // N, E, S, W  (yaw 0 faces -z)
-const center = (t) => (t + 0.5) * T;
+// ---------------------------------------------------------------- player
+const player = new Player(world, canvas, world.start);
+// tweak the feel here, e.g. new Player(world, canvas, world.start, { walkSpeed: 3 * T, jumpHeight: 0.25 * T })
 
-const party = {
-  tx: world.start.tx, tz: world.start.tz, dir: world.start.dir,
-  x: center(world.start.tx), z: center(world.start.tz),
-  yaw: world.start.dir * Math.PI / 2,
-};
-let anim = null;
-
-const keys = new Set();
-addEventListener('keydown', (e) => { keys.add(e.code); if (e.code.startsWith('Arrow')) e.preventDefault(); });
-addEventListener('keyup',   (e) => keys.delete(e.code));
-const down = (...c) => c.some((k) => keys.has(k));
-
-function tryStep(relDir) {
-  const d = (party.dir + relDir + 4) % 4;
-  const nx = party.tx + DIRS[d][0], nz = party.tz + DIRS[d][1];
-  if (!isWalkable(nx, nz)) return;    // TODO: bump sound / feedback
-  anim = {
-    t: 0, dur: MOVE_TIME, kind: 'move',
-    fx: party.x, fz: party.z, tx: center(nx), tz: center(nz), yaw0: party.yaw, yaw1: party.yaw,
-  };
-  party.tx = nx; party.tz = nz;
-}
-
-function turn(sign) {
-  party.dir = (party.dir + sign + 4) % 4;
-  anim = {
-    t: 0, dur: TURN_TIME, kind: 'turn',
-    fx: party.x, fz: party.z, tx: party.x, tz: party.z, yaw0: party.yaw, yaw1: party.yaw + sign * Math.PI / 2,
-  };
-}
-
-function updateParty(dt) {
-  if (!anim) {
-    if (down('KeyQ'))                          turn(-1);
-    else if (down('KeyE'))                     turn(+1);
-    else if (down('KeyW', 'ArrowUp'))          tryStep(0);
-    else if (down('KeyS', 'ArrowDown'))        tryStep(2);
-    else if (down('KeyA'))                     tryStep(3);
-    else if (down('KeyD'))                     tryStep(1);
-    if (!anim && down('ArrowLeft'))            turn(-1);
-    if (!anim && down('ArrowRight'))           turn(+1);
-  }
-  let bob = 0;
-  if (anim) {
-    anim.t += dt;
-    const u = Math.min(1, anim.t / anim.dur);
-    const e = u * u * (3 - 2 * u);
-    party.x = anim.fx + (anim.tx - anim.fx) * e;
-    party.z = anim.fz + (anim.tz - anim.fz) * e;
-    party.yaw = anim.yaw0 + (anim.yaw1 - anim.yaw0) * e;
-    if (anim.kind === 'move') bob = Math.sin(u * Math.PI) * 0.07;
-    if (u >= 1) anim = null;
-  }
-  const s = Math.sin(party.yaw), c = Math.cos(party.yaw);
-  uniforms.uCamPos.value.set(party.x, EYE_Y + bob, party.z);
-  uniforms.uCamFwd.value.set(s, 0, -c);
-  uniforms.uCamRight.value.set(c, 0, s);
-}
+const hint = document.getElementById('hint');
+if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly · Esc release mouse';
+const debugEl = document.getElementById('debug');
 
 // ---------------------------------------------------------------- loop
 let last = performance.now();
 function frame(now) {
-  const dt = Math.min(0.05, (now - last) / 1000);
+  const dt = (now - last) / 1000;
   last = now;
-  uniforms.uTime.value = now / 1000;
-  updateParty(dt);
+  const time = now / 1000;
+  uniforms.uTime.value = time;
+
+  player.update(dt);
+  const e = player.eye;
+  uniforms.uCamPos.value.set(e.x, e.y, e.z);
+  uniforms.uCamFwd.value.set(...player.forward);
+  uniforms.uCamRight.value.set(...player.right);
+  uniforms.uCamUp.value.set(...player.up);
+  player.torchPosition(lightPos[0]);
+
+  // flicker
+  lightCol[0].copy(torchBase).multiplyScalar(1 + 0.06 * Math.sin(time * 9) + 0.04 * Math.sin(time * 23));
+  staticLights.forEach((l, i) => {
+    lightCol[i + 1].copy(l.base).multiplyScalar(1 + 0.10 * Math.sin(time * 7 + i * 2.3) + 0.06 * Math.sin(time * 19 + i));
+  });
+
+  if (SHOW_DEBUG && debugEl) {
+    debugEl.textContent =
+      `pos ${player.x.toFixed(1)} ${player.y.toFixed(1)} ${player.z.toFixed(1)}\n` +
+      `vel ${player.vx.toFixed(1)} ${player.vy.toFixed(1)} ${player.vz.toFixed(1)}\n` +
+      `${player.onGround ? 'ground' : 'air'}${player.fly ? ' · fly' : ''}\n` +
+      `keys ${[...player.keys].join(' ') || '-'}`;
+  }
+
   renderer.render(scene, camera);
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
 
-// ---------------------------------------------------------------- side panel UI (placeholders)
-const PARTY = [
-  { name: 'Jace',    color: '#7a4b2a' },
-  { name: 'The Truth', color: '#5b3a2a' },
-  { name: 'Mark',    color: '#a66a4a' },
-  { name: 'Reverie', color: '#3a4a7a' },
-];
-const partyEl = document.getElementById('party');
-for (const m of PARTY) {
-  partyEl.insertAdjacentHTML('beforeend', `
-    <div class="card">
-      <div class="name">${m.name}</div>
-      <div class="body">
-        <div class="slots"><div class="slot"></div><div class="slot"></div><div class="slot"></div><div class="slot"></div></div>
-        <div class="portrait" style="background:${m.color}"></div>
-      </div>
-      <div class="bar"><i class="hp" style="width:100%"></i></div>
-      <div class="bar" style="margin-top:1px"><i class="mp" style="width:100%"></i></div>
-    </div>`);
+// Vite hot-swap: edit shader.js and see it live without losing your position
+if (import.meta.hot) {
+  import.meta.hot.accept('./shader.js', (mod) => {
+    if (!mod) return;
+    material.vertexShader = mod.vert;
+    material.fragmentShader = mod.frag;
+    material.needsUpdate = true;
+  });
 }
-const invEl = document.getElementById('inventory');
-for (let i = 0; i < 8 * 6; i++) invEl.insertAdjacentHTML('beforeend', '<div class="cell"></div>');

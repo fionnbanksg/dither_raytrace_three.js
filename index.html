@@ -5,51 +5,22 @@
 <title>Levers and Chests</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  html, body { margin: 0; height: 100%; background: #111; overflow: hidden; font-family: monospace; color: #fff; }
-  #game { display: grid; grid-template-columns: 1fr 22%; height: 100vh; }
-
-  /* ---- 3D viewport ---- */
-  #viewport { position: relative; background: #000; min-width: 0; min-height: 0; }
-  #view { display: block; width: 100%; height: 100%; image-rendering: pixelated; image-rendering: crisp-edges; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: monospace; color: #fff; }
+  #viewport { position: fixed; inset: 0; }
+  #view { display: block; width: 100%; height: 100%; image-rendering: pixelated; image-rendering: crisp-edges; cursor: crosshair; }
   #title { position: absolute; top: 8px; left: 10px; font-size: 18px; text-shadow: 1px 1px 0 #000; pointer-events: none; }
   #hint  { position: absolute; bottom: 8px; left: 10px; font-size: 12px; opacity: .6; text-shadow: 1px 1px 0 #000; pointer-events: none; }
-
-  /* ---- side panel ---- */
-  #panel {
-    background: repeating-linear-gradient(45deg, #8d8d8d 0 3px, #868686 3px 6px);
-    padding: 8px; box-sizing: border-box; display: flex; flex-direction: column; gap: 8px; overflow: hidden;
-    image-rendering: pixelated;
-  }
-  #party { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; border: 3px solid #5a5a5a; padding: 4px; background: #666; }
-  .card { background: #7d7d7d; border: 2px solid #4c4c4c; padding: 3px; }
-  .card .name { font-size: 12px; margin-bottom: 2px; color: #111; }
-  .card .body { display: flex; gap: 3px; }
-  .slots { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; width: 50%; }
-  .slot, .cell { background: #5d5d5d; border: 2px solid #444; aspect-ratio: 1; box-sizing: border-box; }
-  .portrait { flex: 1; aspect-ratio: 1; border: 2px solid #333; }
-  .bar { height: 5px; margin-top: 3px; background: #3a3a3a; }
-  .bar > i { display: block; height: 100%; }
-  .hp { background: #54c92a; }  .mp { background: #a64be0; margin-top: 1px; }
-  #inventory { display: grid; grid-template-columns: repeat(8, 1fr); gap: 0; border: 3px solid #5a5a5a; background: #666; padding: 4px; }
-  .cell { border-width: 1px; }
+  #debug { position: absolute; top: 8px; right: 10px; font-size: 11px; opacity: .6; text-shadow: 1px 1px 0 #000; pointer-events: none; text-align: right; white-space: pre; }
 </style>
 </head>
 <body>
-<div id="game">
-  <div id="viewport">
-    <canvas id="view"></canvas>
-    <div id="title">Levers and Chests pre alpha</div>
-    <div id="hint">W/S move &middot; A/D strafe &middot; Q/E turn</div>
-  </div>
-  <div id="panel">
-    <div id="party"></div>
-    <div id="inventory"></div>
-  </div>
+<div id="viewport">
+  <canvas id="view"></canvas>
+  <div id="title">Levers and Chests pre alpha</div>
+  <div id="hint"></div>
+  <div id="debug"></div>
 </div>
 
-<script type="importmap">
-{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js" } }
-</script>
 <script type="module" src="./main.js"></script>
 </body>
 </html>
