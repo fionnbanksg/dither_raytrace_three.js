@@ -30,6 +30,9 @@ uniform vec3  uPalette[8];
 uniform vec3  uLightPos[8];
 uniform vec3  uLightCol[8]; // colour * intensity
 uniform int   uLightCount;
+uniform sampler2D uParticles;   // 3 texels x N rows, see particles.js
+uniform int   uParticleCount;   // live voxel-cube particles
+uniform vec4  uPBound;          // bounding sphere of all particles (xyz, r): rays that miss it skip the loop
 
 layout(location = 0) out highp vec4 fragColor;
 
@@ -168,26 +171,18 @@ vec3 sky(vec3 rd) {
   return vec3(0.008, 0.012, 0.03) + star * 0.7;
 }
 
-vec3 shade(Hit h, vec3 ro, vec3 rd) {
-  vec3 p = ro + rd * h.t;
-
-  if (h.id == EMISSIVE_ID) {
-    float fl = 0.85 + 0.3 * hash13(floor(vec3(h.cell) / uBlock) + floor(uTime * 8.0));
-    return uPalette[h.id] * uEmissive * fl;
-  }
-
-  vec3  alb = albedo(h.id, h.cell);
-  float ao  = faceAO(h.cell, h.n, p);
+// Ambient + every light with a (jittered, soft) shadow ray. Shared by world voxels and particle cubes.
+vec3 lightSurface(vec3 p, vec3 n, vec3 alb, float ao) {
   vec3  lit = alb * vec3(0.6, 0.7, 1.0) * uAmbient * ao;
 
-  vec3 sp = p + h.n * 0.3;                                  // shadow ray origin
+  vec3 sp = p + n * 0.3;                                    // shadow ray origin
   for (int i = 0; i < 8; i++) {
     if (i >= uLightCount) break;
 
     vec3  L = uLightPos[i] - sp;
     float d = length(L);
     L /= d;
-    float ndl = max(dot(h.n, L), 0.0);
+    float ndl = max(dot(n, L), 0.0);
     if (ndl <= 0.0) continue;
 
     float du  = d * uInvScale;
@@ -211,6 +206,71 @@ vec3 shade(Hit h, vec3 ro, vec3 rd) {
   return lit;
 }
 
+vec3 shade(Hit h, vec3 ro, vec3 rd) {
+  vec3 p = ro + rd * h.t;
+
+  if (h.id == EMISSIVE_ID) {
+    float fl = 0.85 + 0.3 * hash13(floor(vec3(h.cell) / uBlock) + floor(uTime * 8.0));
+    return uPalette[h.id] * uEmissive * fl;
+  }
+
+  vec3  alb = albedo(h.id, h.cell);
+  float ao  = faceAO(h.cell, h.n, p);
+  return lightSurface(p, h.n, alb, ao);
+}
+
+// ------------------------------------------------------------ particles
+// Explosion particles are axis-aligned cubes snapped to the voxel lattice (see particles.js).
+// Nearest-hit wins, so there is no blend ordering to worry about. Transparency is done per voxel
+// cell: a cube is opaque only in the cells whose hash is below its opacity, so smoke and dying
+// flames dissolve voxel by voxel and rays pass through the gaps to whatever is behind.
+bool traceParticles(vec3 ro, vec3 rd, float tMax, out float tBest, out vec3 nBest, out int iBest) {
+  tBest = tMax; nBest = vec3(0.0); iBest = -1;
+  if (uParticleCount == 0) return false;
+
+  vec3  oc = uPBound.xyz - ro;                         // does this ray touch the particle cloud at all?
+  float tc = dot(oc, rd);
+  if (tc < -uPBound.w || dot(oc, oc) - tc * tc > uPBound.w * uPBound.w) return false;
+
+  vec3 inv = 1.0 / rd;
+  for (int i = 0; i < uParticleCount; i++) {
+    vec4 A = texelFetch(uParticles, ivec2(0, i), 0);
+    vec3 t0 = (A.xyz - A.w - ro) * inv;
+    vec3 t1 = (A.xyz + A.w - ro) * inv;
+    vec3 tmn = min(t0, t1), tmx = max(t0, t1);
+    float tn = max(max(tmn.x, tmn.y), tmn.z);
+    float tf = min(min(tmx.x, tmx.y), tmx.z);
+    if (tn <= 0.0 || tn >= tBest || tf < tn) continue;   // behind the camera, camera inside, or farther than the nearest
+
+    vec3 n = -sign(rd) * step(tmn.yzx, tmn) * step(tmn.zxy, tmn);
+    vec4 B = texelFetch(uParticles, ivec2(1, i), 0);
+    vec4 C = texelFetch(uParticles, ivec2(2, i), 0);
+    ivec3 cell = ivec3(floor(ro + rd * tn - n * 0.5));    // the voxel cell this ray enters
+    if (hash13(vec3(cell) + C.w * 131.0) >= B.w) continue; // dissolved cell: ray passes through
+
+    tBest = tn; nBest = n; iBest = i;
+  }
+  return iBest >= 0;
+}
+
+vec3 shadeParticle(int i, vec3 ro, vec3 rd, float t, vec3 n) {
+  vec4 B = texelFetch(uParticles, ivec2(1, i), 0);
+  vec4 C = texelFetch(uParticles, ivec2(2, i), 0);
+  vec3 p = ro + rd * t;
+  ivec3 cell = ivec3(floor(p - n * 0.5));
+  float v = 0.85 + 0.3 * hash13(vec3(cell) + C.w * 53.0 + 7.0);   // per-voxel grit, like the world
+  float face = n.y > 0.5 ? 1.0 : (n.y < -0.5 ? 0.55 : 0.8);       // top / side / bottom, so cubes read as cubes
+
+  vec3 col = vec3(0.0);
+  vec3 alb = B.rgb * v;
+  if (max(alb.r, max(alb.g, alb.b)) > 0.002) col = lightSurface(p, n, alb, 1.0);
+
+  // flames: each voxel flickers on its own
+  float fl = 0.75 + 0.5 * hash13(vec3(cell) + floor(uTime * 12.0) + C.w * 17.0);
+  col += C.rgb * fl * face * v;
+  return col;
+}
+
 // ------------------------------------------------------------ main
 void main() {
   vec2 uv = (gl_FragCoord.xy / uRes) * 2.0 - 1.0;
@@ -226,6 +286,11 @@ void main() {
     col *= exp(-h.t * uInvScale * 0.03);
   } else {
     col = sky(rd);
+  }
+
+  float pt; vec3 pn; int pi;
+  if (traceParticles(ro, rd, h.hit ? h.t : 1e9, pt, pn, pi)) {
+    col = shadeParticle(pi, ro, rd, pt, pn) * exp(-pt * uInvScale * 0.03);
   }
 
   // tone + ordered dither

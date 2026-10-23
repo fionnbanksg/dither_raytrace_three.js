@@ -5,6 +5,7 @@ import { Player } from './player.js';
 import { Input } from './input.js';
 import { createPhysics, FIXED_DT, TILE_M, M2V, mToVoxX, mToVoxY, mToVoxZ } from './physics.js';
 import { explode, raycastVoxels, voxelAt, warmUp } from './destruction.js';
+import { Particles, MAX_PARTICLES, TEXELS } from './particles.js';
 
 // ---------------------------------------------------------------- settings
 const INTERNAL_HEIGHT = 360;   // render resolution (width follows aspect ratio)
@@ -16,8 +17,10 @@ const MAX_FRAME_DT    = 0.1;   // clamp to avoid a spiral of death after a tab s
 const BLAST_RADIUS_M  = 2.0;   // left click: crater radius in metres (a tile is 4 m wide)
 const BIG_BLAST_MUL   = 1.8;   // right click: bigger blast
 const BLAST_PUSH      = 13;    // m/s of knockback at point-blank range
-const FLASH_LIFE      = 0.9;   // seconds the explosion light lasts
+const FLASH_LIFE      = 1.4;   // seconds the explosion light lasts (it lingers while the fire burns)
 const FLASH_PEAK      = 14;    // explosion light intensity (braziers are 3, torch 2.2)
+const SHAKE_AMOUNT    = 1.0;   // camera shake strength for a nearby blast (0 = off)
+const DEBRIS_PER_BLAST = 56;   // chunks of the destroyed material thrown out (max)
 
 // ---------------------------------------------------------------- renderer
 const canvas = document.getElementById('view');
@@ -69,6 +72,14 @@ world.lights.slice(0, MAX_LIGHTS - 1).forEach((l, i) => lightPos[i + 1].set(...l
 const BASE_LIGHTS = 1 + staticLights.length;   // torch + braziers; slots after these are explosion flashes
 const lightCount = BASE_LIGHTS;
 
+// Explosion particles live on the CPU; their packed state is uploaded as a small float texture
+// that the shader reads (see applyParticles in shader.js).
+const particles = new Particles(solidVoxel, M2V);
+const particleTex = new THREE.DataTexture(particles.data, TEXELS, MAX_PARTICLES, THREE.RGBAFormat, THREE.FloatType);
+particleTex.minFilter = particleTex.magFilter = THREE.NearestFilter;
+particleTex.generateMipmaps = false;
+particleTex.needsUpdate = true;
+
 const uniforms = {
   uVoxels:   { value: voxelTex },
   uCoarse:   { value: coarseTex },
@@ -91,6 +102,9 @@ const uniforms = {
   uLightCol:   { value: lightCol },
   uLightCount: { value: lightCount },
   uPalette:  { value: palette },
+  uParticles: { value: particleTex },
+  uParticleCount: { value: 0 },
+  uPBound: { value: new THREE.Vector4() },
 };
 
 const material = new THREE.ShaderMaterial({
@@ -161,10 +175,14 @@ function blast(radiusM) {
 
   const R = radiusM * M2V;                                    // metres -> voxels
   const c = hit.point.map((p, i) => p + hit.normal[i] * R * 0.3);   // nudge out of the wall so the crater opens into the room
+  const debris = [];
   const box = explode(world, c, R, {
     keepClear: [{ x: mToVoxX(player.x), z: mToVoxZ(player.z), r: 0.9 * M2V }],   // no rubble under the player's feet
+    debrisOut: debris, debrisMax: DEBRIS_PER_BLAST,
   });
   if (!box) return;
+
+  particles.burst(c, hit.normal, radiusM / BLAST_RADIUS_M, debris);
 
   uploadVoxelBox(box);
   coarseTex.needsUpdate = true;                               // 157 KB, cheap to re-upload whole
@@ -188,12 +206,15 @@ function blast(radiusM) {
     const s = BLAST_PUSH * k * Math.sqrt(radiusM / BLAST_RADIUS_M);
     player.knock(dx * s, Math.max(dy, 0.35) * s, dz * s);
   }
+  shake = Math.max(shake, SHAKE_AMOUNT * Math.min(1, Math.sqrt(radiusM / BLAST_RADIUS_M)) * Math.max(0, 1 - dist / (radiusM * 6)));
 }
 
 // ---------------------------------------------------------------- loop
 let last = performance.now();
 let acc = 0;
 const eye = new THREE.Vector3();
+let shake = 0;    // camera shake, decays after a blast
+let particlesLive = false;
 let torchK = 1;   // 0 = torch at the eye, 1 = full offset
 function frame(now) {
   const dt = Math.min(MAX_FRAME_DT, (now - last) / 1000);
@@ -218,7 +239,15 @@ function frame(now) {
   const { forward, right, up } = Player.basis(input.yaw, input.pitch);
   player.eyeVoxels(eye);
   uniforms.uCamPos.value.copy(eye);
-  uniforms.uCamFwd.value.set(...forward);
+  if (shake > 0.01) {
+    const k = shake * shake * 0.03;                        // look wobble (radians-ish)
+    const sx = Math.random() * 2 - 1, sy = Math.random() * 2 - 1;
+    uniforms.uCamFwd.value.set(forward[0] + right[0] * sx * k + up[0] * sy * k, forward[1] + right[1] * sx * k + up[1] * sy * k, forward[2] + right[2] * sx * k + up[2] * sy * k).normalize();
+    shake *= Math.exp(-5 * dt);
+  } else {
+    shake = 0;
+    uniforms.uCamFwd.value.set(...forward);
+  }
   uniforms.uCamRight.value.set(...right);
   uniforms.uCamUp.value.set(...up);
 
@@ -248,11 +277,23 @@ function frame(now) {
   for (let i = flashes.length - 1; i >= 0; i--) if (time - flashes[i].t0 > FLASH_LIFE) flashes.splice(i, 1);
   flashes.forEach((f, i) => {
     const age = (time - f.t0) / FLASH_LIFE;
-    const e = Math.exp(-age * 5) * (1 - age) * FLASH_PEAK * f.scale;
-    lightPos[BASE_LIGHTS + i].set(...f.pos);
-    lightCol[BASE_LIGHTS + i].set(1.0, 0.62, 0.3).multiplyScalar(e);
+    const flick = 1 + 0.25 * Math.sin(time * 31 + i * 5.1) + 0.15 * Math.sin(time * 53 + i);
+    const e = (0.75 * Math.exp(-age * 5) + 0.25 * Math.exp(-age * 1.6)) * (1 - age) * FLASH_PEAK * f.scale * flick;
+    lightPos[BASE_LIGHTS + i].set(f.pos[0], f.pos[1] + age * 6 * M2V * 0.25, f.pos[2]);   // the fire climbs a little as it burns
+    // white-orange at the start, cooling to red
+    lightCol[BASE_LIGHTS + i].set(1.0, 0.62 - 0.3 * age, 0.3 - 0.22 * age).multiplyScalar(e);
   });
   uniforms.uLightCount.value = BASE_LIGHTS + flashes.length;
+
+  // particles: simulate, pack, upload only while something is alive
+  particles.update(dt);
+  if (particles.count > 0 || particlesLive) {
+    particles.pack();
+    uniforms.uParticleCount.value = particles.packed;
+    uniforms.uPBound.value.set(...particles.bound);
+    particleTex.needsUpdate = true;
+    particlesLive = particles.count > 0;
+  }
 
   if (SHOW_DEBUG && debugEl) {
     const fy = player.y - player.centreOffset;
@@ -261,7 +302,7 @@ function frame(now) {
       `vel ${player.vx.toFixed(2)} ${player.vy.toFixed(2)} ${player.vz.toFixed(2)}\n` +
       `${player.onGround ? 'ground' : 'air'}${player.fly ? ' · fly' : ''}${input.locked ? '' : ' · click to capture mouse'}\n` +
       `keys ${[...input.keys].join(' ') || '-'}\n` +
-      `${physics.triangles} collision tris`;
+      `${physics.triangles} collision tris · ${particles.count} particles`;
   }
 
   renderer.render(scene, camera);

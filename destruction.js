@@ -71,6 +71,9 @@ export function explode(world, center, radius, opts = {}) {
   const [cx, cy, cz] = center;
   const R = radius;
 
+  const debrisOut = opts.debrisOut ?? null;   // optional array: receives { x, y, z, id } samples of carved voxels
+  const debrisMax = opts.debrisMax ?? 64;
+  const debrisChance = opts.debrisChance ?? Math.min(1, (debrisMax * 1.3) / (2.1 * R * R * R));   // aim for ~debrisMax samples spread over the crater
   const rMax = R * 1.2;                 // crater is a noisy sphere: r in [0.8R, 1.2R]
   const reach = R * 1.5;                // scorch / rubble reach
   const x0 = Math.max(0, Math.floor(cx - reach)), x1 = Math.min(sx, Math.ceil(cx + reach) + 1);
@@ -94,9 +97,14 @@ export function explode(world, center, radius, opts = {}) {
     if (d2 > r2max) continue;
     const i = idx(x, y, z);
     if (data[i] === 0 || !breakable(x, y, z)) continue;
-    if (d2 < rIn2) { data[i] = 0; carved++; continue; }      // always inside: skip the noise lookup
-    const r = craterR(x, y, z);
-    if (d2 < r * r) { data[i] = 0; carved++; }
+    const id = data[i];
+    let gone = false;
+    if (d2 < rIn2) gone = true;                               // always inside: skip the noise lookup
+    else { const r = craterR(x, y, z); gone = d2 < r * r; }
+    if (!gone) continue;
+    data[i] = 0; carved++;
+    // sample a few removed voxels so the caller can spawn debris of the right material
+    if (debrisOut && debrisOut.length < debrisMax && Math.random() < debrisChance) debrisOut.push({ x: x + 0.5, y: y + 0.5, z: z + 0.5, id });
   }
   if (carved === 0) return null;
 
