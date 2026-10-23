@@ -36,6 +36,10 @@ uniform vec3  uGunOff;          // viewmodel offset in camera space (recoil, bob
 uniform float uMuzzle;          // muzzle flash 0..1
 uniform float uGunType;         // 0 = grenade launcher, 1 = lava gun
 uniform vec4  uPBound;          // bounding sphere of all particles (xyz, r): rays that miss it skip the loop
+uniform sampler3D uGlow;        // light thrown by resting lava, R8, one texel = uGlowTexel voxels (see lavaglow.js)
+uniform vec3  uGlowCol;         // glow colour * strength
+uniform float uGlowScale;       // field value that byte 255 stands for
+uniform float uGlowTexel;       // voxels per glow texel
 
 layout(location = 0) out highp vec4 fragColor;
 
@@ -185,6 +189,42 @@ vec3 sky(vec3 rd) {
   return vec3(0.008, 0.012, 0.03) + star * 0.7;
 }
 
+float lavaNoise(vec3 p) {
+  vec3 c = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  float a = hash13(c),                  b = hash13(c + vec3(1, 0, 0));
+  float cc = hash13(c + vec3(0, 1, 0)), d = hash13(c + vec3(1, 1, 0));
+  float e = hash13(c + vec3(0, 0, 1)),  g = hash13(c + vec3(1, 0, 1));
+  float h = hash13(c + vec3(0, 1, 1)),  i = hash13(c + vec3(1, 1, 1));
+  return mix(mix(mix(a, b, f.x), mix(cc, d, f.x), f.y), mix(mix(e, g, f.x), mix(h, i, f.x), f.y), f.z);
+}
+
+// ------------------------------------------------------------ lava glow
+// The glow field is built on the CPU from lava cells that are resting on something (lavaglow.js), spread through
+// open air only, so a wall facing a puddle lights up and the room next door stays dark.
+float glowAt(vec3 p) {
+  return texture(uGlow, p / uSize).r * uGlowScale;
+}
+
+vec3 lavaGlow(vec3 p, vec3 n, vec3 alb, float ao) {
+  vec3  q = p + n * (uGlowTexel * 0.5);                 // step off the surface so we read the air texel, not the stone
+  float g = glowAt(q);
+  if (g < 0.01) return vec3(0.0);
+
+  // the field's gradient points at the brighter side = towards the lava: surfaces facing it get the full glow,
+  // surfaces turned away still get a diffuse share (the light has soaked into the space around them)
+  float e = uGlowTexel;
+  vec3 grad = vec3(glowAt(q + vec3(e, 0, 0)) - glowAt(q - vec3(e, 0, 0)),
+                   glowAt(q + vec3(0, e, 0)) - glowAt(q - vec3(0, e, 0)),
+                   glowAt(q + vec3(0, 0, e)) - glowAt(q - vec3(0, 0, e)));
+  float gl = length(grad);
+  float facing = gl > 0.02 ? clamp(dot(n, grad / gl), 0.0, 1.0) : 0.5;
+  float wrap = 0.35 + 0.65 * facing;
+
+  float slow = 0.88 + 0.24 * lavaNoise(vec3(q.x * 0.04, q.z * 0.04, uTime * 0.3));   // the crust breathes, slowly
+  return alb * uGlowCol * g * wrap * slow * mix(1.0, ao, 0.5);
+}
+
 // Ambient + every light with a (jittered, soft) shadow ray. Shared by world voxels and particle cubes.
 vec3 lightSurface(vec3 p, vec3 n, vec3 alb, float ao) {
   vec3  lit = alb * vec3(0.6, 0.7, 1.0) * uAmbient * ao;
@@ -217,21 +257,12 @@ vec3 lightSurface(vec3 p, vec3 n, vec3 alb, float ao) {
 
     lit += alb * contrib * mix(1.0, ao, 0.6);
   }
-  return lit;
+  return lit + lavaGlow(p, n, alb, ao);
 }
 
 
 // Lava: emissive like the braziers, but with slow drifting hot/cool blotches (value noise in voxel blocks)
 // so it reads as molten rock with a darker crust rather than a flat orange slab. Hot cells go yellow-white.
-float lavaNoise(vec3 p) {
-  vec3 c = floor(p), f = fract(p);
-  f = f * f * (3.0 - 2.0 * f);
-  float a = hash13(c),                  b = hash13(c + vec3(1, 0, 0));
-  float cc = hash13(c + vec3(0, 1, 0)), d = hash13(c + vec3(1, 1, 0));
-  float e = hash13(c + vec3(0, 0, 1)),  g = hash13(c + vec3(1, 0, 1));
-  float h = hash13(c + vec3(0, 1, 1)),  i = hash13(c + vec3(1, 1, 1));
-  return mix(mix(mix(a, b, f.x), mix(cc, d, f.x), f.y), mix(mix(e, g, f.x), mix(h, i, f.x), f.y), f.z);
-}
 // All animation is smooth (time is a continuous noise axis, no stepped hashes), so nothing pops or flickers.
 vec3 shadeLava(Hit h, vec3 p) {
   float s = uBlock * 3.0;                                              // blotch size in voxels
@@ -385,6 +416,7 @@ vec3 shadeGun(int i, vec3 rdc, float t, vec3 nc) {
     float du = d * uInvScale;
     lit += alb * uLightCol[k] * max(dot(nw, L / d), 0.0) / (1.0 + 0.07 * du * du);
   }
+  lit += alb * uGlowCol * glowAt(pw) * 0.8;                           // soaked in the glow of any lava nearby
   lit += alb * vec3(1.0, 0.55, 0.2) * uMuzzle * 1.5;                  // muzzle flash lights the barrel
   if (i == 5) lit += vec3(1.0, 0.45, 0.1) * (1.1 + 0.3 * sin(uTime * 5.0) + uMuzzle) * v;   // energy cell
   if (i == 9) lit += vec3(1.0, 0.42, 0.08) * (1.3 + 1.6 * uMuzzle) * v;                      // glowing nozzle lip

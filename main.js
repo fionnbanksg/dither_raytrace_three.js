@@ -10,6 +10,7 @@ import { Projectiles } from './projectiles.js';
 import { DebugOverlay } from './debug.js';
 import { Minimap } from './minimap.js';
 import { LavaSim } from './lava.js';
+import { LavaGlow, warmUpGlow } from './lavaglow.js';
 import { LavaGun } from './lavagun.js';
 
 // ---------------------------------------------------------------- settings
@@ -76,6 +77,18 @@ const solidVoxel = (x, y, z) => {
   return world.data[ix + world.size.x * (iy + world.size.y * iz)] !== 0;
 };
 
+// Lava sim + its glow field. Resting lava cells feed a coarse 3D texture (lavaglow.js) that the shader samples to
+// light every solid surface near them, so blobs on the ground glow onto walls, floors and props around them.
+const LAVA_GLOW_COL = new THREE.Vector3(1.0, 0.38, 0.09).multiplyScalar(3.0);   // colour * strength of the glow
+const lava = new LavaSim(world, { cell: 2, width: 1, viscosity: 0.6, reach: 8, period: 15, passes: 15 });
+const lavaGlow = new LavaGlow(world, lava);
+const glowTex = new THREE.Data3DTexture(lavaGlow.data, lavaGlow.nx, lavaGlow.ny, lavaGlow.nz);
+glowTex.format = THREE.RedFormat;
+glowTex.type = THREE.UnsignedByteType;
+glowTex.minFilter = glowTex.magFilter = THREE.LinearFilter;   // trilinear: smooth falloff between texels
+glowTex.unpackAlignment = 1;
+glowTex.needsUpdate = true;
+
 const palette = Array.from({ length: 10 }, (_, i) => new THREE.Vector3(...(PALETTE[i] ?? [1, 0, 1])));
 
 // Lights: index 0 is the player's torch (follows the camera), the rest come from the world.
@@ -89,8 +102,7 @@ const staticLights = world.lights.slice(0, MAX_LIGHTS - 1).map((l) => ({
   dead: false,
 }));
 world.lights.slice(0, MAX_LIGHTS - 1).forEach((l, i) => lightPos[i + 1].set(...l.pos));
-const LAVA_LIGHT = 1 + staticLights.length;    // one light over the lava pool (centroid); see lava.light()
-const BASE_LIGHTS = LAVA_LIGHT + 1;            // torch + braziers + lava; slots after these are shells / explosion flashes
+const BASE_LIGHTS = 1 + staticLights.length;   // torch + braziers; slots after these are shells / explosion flashes (lava glows via the glow field, not a light)
 const lightCount = BASE_LIGHTS;
 
 // Explosion particles live on the CPU; their packed state is uploaded as a small float texture
@@ -129,6 +141,10 @@ const uniforms = {
   uGunType: { value: 0 },
   uParticleCount: { value: 0 },
   uPBound: { value: new THREE.Vector4() },
+  uGlow: { value: glowTex },
+  uGlowCol: { value: LAVA_GLOW_COL },
+  uGlowScale: { value: lavaGlow.max },
+  uGlowTexel: { value: lavaGlow.G },
 };
 
 const material = new THREE.ShaderMaterial({
@@ -157,6 +173,7 @@ resize();
 const physics = await createPhysics(world);   // collision mesh + Rapier world (a second or two)
 
 warmUp();   // JIT the explosion code on a scratch grid so the first real blast doesn't hitch
+warmUpGlow();   // same for the lava glow solver
 
 // world.spawns are spread across the map (farthest-point sampling). Multiplayer: the server assigns the index.
 const spawnPoint = world.spawns[(parseInt(params.get('spawn'), 10) || 0) % world.spawns.length];
@@ -225,16 +242,15 @@ addEventListener('keydown', (e) => {
 // 1. explode() edits world.data (voxels + coarse grid) on the CPU
 // 2. the changed box is pushed to the GPU texture with texSubImage3D (not the whole 80 MB volume)
 // 3. physics.updateRegion() re-meshes only the collision chunks that changed
-function uploadVoxelBox(box) {
-  const glTex = renderer.properties.get(voxelTex).__webglTexture;
-  if (!glTex) { voxelTex.needsUpdate = true; return; }       // not on the GPU yet: the normal full upload covers it
+function uploadBox(tex, data, size, box) {
+  const glTex = renderer.properties.get(tex).__webglTexture;
+  if (!glTex) { tex.needsUpdate = true; return; }              // not on the GPU yet: the normal full upload covers it
   const w = box.x1 - box.x0, h = box.y1 - box.y0, d = box.z1 - box.z0;
   const buf = new Uint8Array(w * h * d);
-  const { x: sx, y: sy } = world.size;
   let o = 0;
   for (let z = box.z0; z < box.z1; z++) for (let y = box.y0; y < box.y1; y++) {
-    const row = box.x0 + sx * (y + sy * z);
-    buf.set(world.data.subarray(row, row + w), o);
+    const row = box.x0 + size.x * (y + size.y * z);
+    buf.set(data.subarray(row, row + w), o);
     o += w;
   }
   gl.bindTexture(gl.TEXTURE_3D, glTex);
@@ -242,6 +258,8 @@ function uploadVoxelBox(box) {
   gl.texSubImage3D(gl.TEXTURE_3D, 0, box.x0, box.y0, box.z0, w, h, d, gl.RED, gl.UNSIGNED_BYTE, buf);
   renderer.resetState();                                      // three caches GL bindings; we changed one behind its back
 }
+function uploadVoxelBox(box) { uploadBox(voxelTex, world.data, world.size, box); }
+function uploadGlowBox(box) { uploadBox(glowTex, lavaGlow.data, lavaGlow.size, box); }
 
 const flashes = [];   // { pos: [x,y,z] voxels, t0 }
 
@@ -267,6 +285,7 @@ function detonate(point, normal, radiusM) {
     // braziers whose flame voxel was destroyed go out
     staticLights.forEach((l) => { if (!l.dead && voxelAt(world, ...l.anchor) !== 6) l.dead = true; });
     lava.notifyCarved(box);                                   // blasts can carve lava away / open new paths for it
+    lavaGlow.carved(box);                                     // ...and open or close paths for its light
   }
 
   stats.blasts++;
@@ -345,9 +364,7 @@ function shoot(shot) {
 // ---------------------------------------------------------------- lava
 // LavaSim (lava.js) writes id-8 voxels into world.data; we push the changed box to the GPU like explosions do.
 const LAVA_STEP = 1 / 30;                 // sim ticks per second: 30
-const lava = new LavaSim(world, { cell: 2, width: 1, viscosity: 0.6, reach: 8, period: 15, passes: 15 });
-let lavaAcc = 0, lavaLightK = 0, lavaLightStr = 0;
-const lavaLightPos = new THREE.Vector3();
+let lavaAcc = 0;
 
 addEventListener('keydown', (e) => {
   if (e.code !== 'KeyL' || e.repeat) return;
@@ -496,21 +513,14 @@ function frame(now) {
   });
   uniforms.uLightCount.value = BASE_LIGHTS + used + (flashes.length - firstFlash);
 
-  // lava: fixed-rate sim, upload the dirty box, light follows the pool
+  // lava: fixed-rate sim, upload the dirty box, then refresh the glow field
   lavaAcc += dt;
   for (let n = 0; lavaAcc >= LAVA_STEP && n < 3; n++) { lava.step(); lavaAcc -= LAVA_STEP; }
   if (lavaAcc > LAVA_STEP * 3) lavaAcc = 0;
   const lbox = lava.flush();
   if (lbox) { uploadVoxelBox(lbox); coarseTex.needsUpdate = true; }
-  const ll = lava.light();
-  if (ll) {                                                   // smooth the light so the moving centroid / growing pool doesn't make it jump
-    const k = 1 - Math.exp(-4 * dt);
-    if (lavaLightK === 0) { lavaLightPos.set(...ll.pos); lavaLightStr = ll.strength; }
-    else { lavaLightPos.x += (ll.pos[0] - lavaLightPos.x) * k; lavaLightPos.y += (ll.pos[1] - lavaLightPos.y) * k; lavaLightPos.z += (ll.pos[2] - lavaLightPos.z) * k; lavaLightStr += (ll.strength - lavaLightStr) * k; }
-    lavaLightK = 1;
-    lightPos[LAVA_LIGHT].copy(lavaLightPos);
-    lightCol[LAVA_LIGHT].set(1.0, 0.38, 0.09).multiplyScalar(10.5 * (0.5 + 0.5 * lavaLightStr) * (1 + 0.03 * Math.sin(time * 2.1)));
-  } else { lightCol[LAVA_LIGHT].set(0, 0, 0); lavaLightK = 0; }
+  const gbox = lavaGlow.update(dt);                           // rebuilds (<= ~7x/s) only when lava changed; light spreads from resting cells
+  if (gbox) uploadGlowBox(gbox);
 
   // particles: simulate, pack, upload only while something is alive
   particles.update(dt);

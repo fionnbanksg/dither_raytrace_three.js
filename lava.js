@@ -4,7 +4,8 @@
 // How it fits the renderer: lava is just another voxel material (id 8). Cells are written into
 // world.data, the changed box is re-uploaded with texSubImage3D and the coarse bricks are refreshed,
 // so the raytracer, AO, shadows, fog and Bayer dither all treat it like the rest of the world.
-// shader.js gives id 8 its emissive animated look; main.js adds a point light over the pool.
+// shader.js gives id 8 its emissive animated look; lavaglow.js turns the cells that are resting on something into a
+// glow field the shader uses to light every solid surface near them (there is no single "pool light" any more).
 //
 // SCALING TO A REAL FLUID SIM — everything fluid-specific is behind these methods:
 //   isFree()   what may a cell flow into          step()    one simulation tick (budgeted)
@@ -16,7 +17,7 @@
 import { refreshCoarse } from './destruction.js';
 
 export const LAVA_ID = 8;
-const Y0 = 1;                                   // voxel row 0 is the floor slab; air starts at y = 1 (same as physics.js)
+export const Y0 = 1;                                 // voxel row 0 is the floor slab; air starts at y = 1 (same as physics.js)
 const DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1]];
 
 export class LavaSim {
@@ -36,7 +37,7 @@ export class LavaSim {
     this.all = new Set();                       // every lava cell
     this.active = new Set();                    // cells that may still move
     this.sources = [];
-    this.sum = [0, 0, 0];                       // for the centroid (light position)
+    this.rev = 0;                               // bumps whenever a cell is placed / removed / carved (lavaglow.js rebuilds when it changes)
     this.dirty = null;
   }
 
@@ -78,14 +79,14 @@ export class LavaSim {
   place(cx, cy, cz) {
     const i = this.idx(cx, cy, cz);
     this.fl[i] = 1; this.all.add(i); this.active.add(i);
-    this.sum[0] += cx; this.sum[1] += cy; this.sum[2] += cz;
+    this.rev++;
     this.write(cx, cy, cz, LAVA_ID);
   }
   remove(cx, cy, cz, erase = true) {
     const i = this.idx(cx, cy, cz);
     if (!this.fl[i]) return;
     this.fl[i] = 0; this.all.delete(i); this.active.delete(i);
-    this.sum[0] -= cx; this.sum[1] -= cy; this.sum[2] -= cz;
+    this.rev++;
     if (erase) this.write(cx, cy, cz, 0);
   }
   wake(cx, cy, cz) {
@@ -126,6 +127,7 @@ export class LavaSim {
   }
   // call after anything else edits voxels (explosions): drops lava cells that were carved away and wakes the rest
   notifyCarved(box) {
+    this.rev++;
     const C = this.C;
     const [a, b, c] = this.cellOfVoxel(box.x0, box.y0, box.z0), [d, e, f] = this.cellOfVoxel(box.x1, box.y1, box.z1);
     const { data } = this.world;
@@ -206,16 +208,5 @@ export class LavaSim {
     this.dirty = null;
     refreshCoarse(this.world, d);
     return d;
-  }
-
-  // where to put the pool's light (voxels) and how strong it should be
-  light() {
-    const n = this.count;
-    if (!n) return null;
-    const C = this.C;
-    return {
-      pos: [(this.sum[0] / n + 0.5) * C, Y0 + (this.sum[1] / n + 0.5) * C + 14, (this.sum[2] / n + 0.5) * C],
-      strength: Math.min(1, 0.25 + Math.sqrt(n) / 40),
-    };
   }
 }
