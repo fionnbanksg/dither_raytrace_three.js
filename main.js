@@ -8,12 +8,14 @@ import { explode, raycastVoxels, voxelAt, warmUp } from './destruction.js';
 import { Particles, MAX_PARTICLES, TEXELS } from './particles.js';
 import { Projectiles } from './projectiles.js';
 import { DebugOverlay } from './debug.js';
+import { Minimap } from './minimap.js';
 
 // ---------------------------------------------------------------- settings
 const INTERNAL_HEIGHT = 360;   // render resolution (width follows aspect ratio)
 const DITHER_LEVELS   = 14;    // colour levels per channel (lower = grittier)
 const DITHER_STRENGTH = 0.7;   // 0 = flat banding, 1 = full Bayer pattern
 const FOV_DEG         = 70;    // vertical FOV
+const MINIMAP_FOG    = false; // true = the map is only revealed around where you have walked
 const SHOW_DEBUG      = false; // start with the F3 debug overlay open
 const MAX_FRAME_DT    = 0.1;   // clamp to avoid a spiral of death after a tab switch
 const BLAST_RADIUS_M  = 2.0;   // left click: crater radius in metres (a tile is 4 m wide)
@@ -158,8 +160,13 @@ const spawn = { x: (spawnPoint.tx + 0.5) * TILE_M, y: 0, z: (spawnPoint.tz + 0.5
 const player = new Player(physics, spawn);    // tweak the feel: new Player(physics, spawn, { walkSpeed: 5, jumpHeight: 1.3 })
 const input = new Input(canvas, { yaw: spawnPoint.yaw });   // spawn facing along the longest open run
 
+const minimapCanvas = document.getElementById('minimap');
+const minimap = minimapCanvas ? new Minimap(minimapCanvas, world, { fog: MINIMAP_FOG }) : null;
+const mapCap = document.getElementById('mapcap');
+if (mapCap) mapCap.textContent = `SEED ${seed}`;
+
 const hint = document.getElementById('hint');
-if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · F3 debug · Esc release mouse · Click: fire grenade · Right click: heavy shell (hold to keep firing)';
+if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · M map · F3 debug · Esc release mouse · Click: fire grenade · Right click: heavy shell (hold to keep firing)';
 
 // ---------------------------------------------------------------- F3 debug overlay
 const stats = { shots: 0, blasts: 0, lastBlast: null };   // counters updated by shoot() / detonate()
@@ -204,6 +211,7 @@ const debug = debugEl && new DebugOverlay(debugEl, () => {
 });
 if (debug && SHOW_DEBUG) debug.toggle();
 addEventListener('keydown', (e) => {
+  if (e.code === 'KeyM' && !e.repeat) minimap?.toggle();
   if (e.code === 'F3') { e.preventDefault(); if (!e.repeat) debug?.toggle(); }
 });
 
@@ -248,6 +256,7 @@ function detonate(point, normal, radiusM) {
     uploadVoxelBox(box);
     coarseTex.needsUpdate = true;                             // 157 KB, cheap to re-upload whole
     physics.updateRegion(box);
+    minimap?.refresh(box);                                    // craters show up on the map
     stats.lastBlast = { dims: `${box.x1 - box.x0}x${box.y1 - box.y0}x${box.z1 - box.z0}`, ms: performance.now() - t0 };
 
     // braziers whose flame voxel was destroyed go out
@@ -438,6 +447,8 @@ function frame(now) {
     particleTex.needsUpdate = true;
     particlesLive = particles.count > 0 || shells.length > 0;
   }
+
+  minimap?.draw({ x: mToVoxX(player.x), z: mToVoxZ(player.z), yaw: input.yaw }, time);
 
   renderer.render(scene, camera);
   debug?.frame(rawMs, performance.now() - cpuStart);

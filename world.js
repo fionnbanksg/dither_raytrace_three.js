@@ -84,20 +84,35 @@ function buildLayout(seed, W, H) {
 
   // 2. tunnels: a minimum spanning tree (everything reachable) + extra edges (loops, so there are
   //    always at least two ways between places). Each link bends through a random waypoint.
-  const carveL = (ax, az, bx, bz, hFirst) => {
-    let x = ax, z = az;
-    dig(x, z);
-    const walkX = () => { while (x !== bx) { x += Math.sign(bx - x); dig(x, z); } };
-    const walkZ = () => { while (z !== bz) { z += Math.sign(bz - z); dig(x, z); } };
-    if (hFirst) { walkX(); walkZ(); } else { walkZ(); walkX(); }
-  };
-  const link = (ra, rb) => {
+  // Links are routed with a cheapest-path search: walking through open tiles is nearly free, while
+  // digging a new wall tile costs more the more open space it touches. That keeps tunnels one tile
+  // wide and apart from each other (no wide blobs), and lets them reuse existing tunnels and rooms.
+  const link = (ra, rb, fresh = false) => {   // fresh: avoid existing tunnels so the link makes a real loop
     const a = centre(ra), b = centre(rb);
-    const clampX = (v) => Math.min(W - 2, Math.max(1, v)), clampZ = (v) => Math.min(H - 2, Math.max(1, v));
-    const mx = clampX(ri(Math.min(a.x, b.x) - 2, Math.max(a.x, b.x) + 2));
-    const mz = clampZ(ri(Math.min(a.z, b.z) - 2, Math.max(a.z, b.z) + 2));
-    carveL(a.x, a.z, mx, mz, rnd() < 0.5);
-    carveL(mx, mz, b.x, b.z, rnd() < 0.5);
+    const noise = new Float32Array(W * H).map(() => rnd() * 2.5);
+    const cost = (x, z) => {
+      if (!inb(x, z)) return Infinity;
+      if (open(x, z)) return fresh && !inRoom(x, z) ? 7 : 1;
+      let adj = 0;
+      for (const [dx, dz] of N4) if (open(x + dx, z + dz)) adj++;
+      return 3 + noise[x + W * z] + 7 * adj;
+    };
+    const dist = new Float32Array(W * H).fill(Infinity), prev = new Int32Array(W * H).fill(-1), done = new Uint8Array(W * H);
+    dist[a.x + W * a.z] = 0;
+    for (;;) {
+      let u = -1, best = Infinity;
+      for (let i = 0; i < dist.length; i++) if (!done[i] && dist[i] < best) { best = dist[i]; u = i; }
+      if (u < 0 || u === b.x + W * b.z) break;
+      done[u] = 1;
+      const ux = u % W, uz = (u / W) | 0;
+      for (const [dx, dz] of N4) {
+        const nx = ux + dx, nz = uz + dz, c = cost(nx, nz);
+        if (c === Infinity) continue;
+        const v = nx + W * nz;
+        if (dist[u] + c < dist[v]) { dist[v] = dist[u] + c; prev[v] = u; }
+      }
+    }
+    for (let v = b.x + W * b.z; v >= 0; v = prev[v]) dig(v % W, (v / W) | 0);
   };
   const dist = (i, j) => { const a = centre(rooms[i]), b = centre(rooms[j]); return Math.abs(a.x - b.x) + Math.abs(a.z - b.z); };
   const inTree = new Set([0]);
@@ -117,7 +132,7 @@ function buildLayout(seed, W, H) {
   for (let i = 0; i < rooms.length; i++) for (let j = i + 1; j < rooms.length; j++) {
     if (!treeEdges.has(i + ',' + j) && !treeEdges.has(j + ',' + i)) extra.push([i, j]);
   }
-  shuffle(extra).slice(0, ri(3, 4)).forEach(([i, j]) => link(rooms[i], rooms[j]));
+  shuffle(extra).slice(0, ri(3, 4)).forEach(([i, j]) => link(rooms[i], rooms[j], true));
 
   // 3. no dead ends: each stub either punches through to the nearest open tile or is filled back in
   for (let pass = 0; pass < 60; pass++) {

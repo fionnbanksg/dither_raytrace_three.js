@@ -11,7 +11,11 @@
   #crosshair { position: absolute; left: 50%; top: 50%; width: 14px; height: 14px; margin: -7px 0 0 -7px; pointer-events: none; opacity: .75; mix-blend-mode: difference;
     background: linear-gradient(#fff,#fff) center/2px 100% no-repeat, linear-gradient(#fff,#fff) center/100% 2px no-repeat; -webkit-mask: radial-gradient(circle, transparent 2px, #000 3px); mask: radial-gradient(circle, transparent 2px, #000 3px); }
   #hint  { position: absolute; bottom: 8px; left: 10px; font-size: 12px; opacity: .6; text-shadow: 1px 1px 0 #000; pointer-events: none; }
-  #debug { display: none; position: absolute; top: 8px; right: 10px; font-size: 11px; line-height: 1.35; opacity: .85; text-shadow: 1px 1px 0 #000; pointer-events: none; text-align: right; }
+  #topright { position: absolute; top: 10px; right: 12px; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; pointer-events: none; }
+  #minimap { display: block; width: min(288px, 30vw); height: auto; image-rendering: pixelated; image-rendering: crisp-edges; background: #0a0a0c; opacity: .94;
+    border: 4px solid #3b3b42; outline: 2px solid #000; box-shadow: inset 0 0 0 2px #17171b, 4px 4px 0 2px rgba(0,0,0,.55); }
+  #mapcap { font-size: 10px; letter-spacing: 1px; opacity: .55; text-shadow: 1px 1px 0 #000; }
+  #debug { display: none; font-size: 11px; line-height: 1.35; opacity: .85; text-shadow: 1px 1px 0 #000; pointer-events: none; text-align: right; }
   #debug.on { display: block; }
   #debug pre { margin: 0; font: inherit; white-space: pre; }
   #debug canvas { display: block; margin: 6px 0 0 auto; image-rendering: pixelated; }
@@ -22,7 +26,11 @@
   <canvas id="view"></canvas>
   <div id="crosshair"></div>
   <div id="hint"></div>
-  <div id="debug"></div>
+  <div id="topright">
+    <canvas id="minimap"></canvas>
+    <div id="mapcap"></div>
+    <div id="debug"></div>
+  </div>
 </div>
 
 <script type="module" src="./main.js"></script>
