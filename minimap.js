@@ -5,13 +5,17 @@
 // - Walls are rim-lit (only the stone touching open space is bright), colours come from the world
 //   PALETTE and are Bayer-dithered to a few levels, like the main view.
 // - Explosions call refresh(box), so craters appear on the map as they are carved.
-// - Multiplayer: call setMarkers([{ x, z, color, yaw }]) with other players (voxel coords).
+// - Heading-up: a square window (VIEW map pixels across, ~10 tiles) rotates around the player so
+//   forward is always up. A red N on the frame rim shows where north is.
+// - Multiplayer: call setMarkers([{ x, z, color, yaw }]) with other players (voxel coords);
+//   off-window players are clamped to the frame edge.
 // - Optional fog of war (fog: true): the map is revealed around the player as they explore.
 
 import { PALETTE, T } from './world.js';
 
 const CELL = 8;          // voxels per map pixel
-const K = 2;             // canvas pixels per map pixel (room for crisp markers)
+const VIEW = 80;         // map pixels across the rotating window (80 = 10 tiles at T = 64)
+const K = 3;             // canvas pixels per window pixel (room for crisp markers)
 const LEVELS = 9;        // colour levels per channel
 const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
 const FOG_RADIUS = 13;   // map pixels revealed around the player (fog mode)
@@ -32,10 +36,15 @@ export class Minimap {
     this.fog = fog;
     this.W = Math.ceil(world.size.x / CELL);
     this.H = Math.ceil(world.size.z / CELL);
-    canvas.width = this.W * K;
-    canvas.height = this.H * K;
+    canvas.width = VIEW * K;
+    canvas.height = VIEW * K;
     this.ctx = canvas.getContext('2d');
     this.ctx.imageSmoothingEnabled = false;
+    this.view = document.createElement('canvas');   // the rotated window, VIEW x VIEW
+    this.view.width = VIEW;
+    this.view.height = VIEW;
+    this.vctx = this.view.getContext('2d');
+    this.vimg = this.vctx.createImageData(VIEW, VIEW);
 
     this.base = document.createElement('canvas');
     this.base.width = this.W;
@@ -49,14 +58,7 @@ export class Minimap {
     this.markers = [];
     this.lastPx = -1; this.lastPz = -1;
 
-    if (fog) {
-      this.fogCanvas = document.createElement('canvas');
-      this.fogCanvas.width = this.W;
-      this.fogCanvas.height = this.H;
-      this.fctx = this.fogCanvas.getContext('2d');
-      this.fctx.fillStyle = '#000';
-      this.fctx.fillRect(0, 0, this.W, this.H);
-    }
+    this.explored = fog ? new Uint8Array(this.W * this.H) : null;
 
     this.rebuild();
   }
@@ -150,32 +152,84 @@ export class Minimap {
     this.lastPx = px; this.lastPz = pz;
     const r = FOG_RADIUS;
     for (let dz = -r; dz <= r; dz++) {
+      const z = pz + dz;
+      if (z < 0 || z >= this.H) continue;
       const dx = Math.floor(Math.sqrt(r * r - dz * dz));
-      this.fctx.clearRect(px - dx, pz + dz, dx * 2 + 1, 1);
+      for (let x = Math.max(0, px - dx); x <= Math.min(this.W - 1, px + dx); x++) this.explored[x + this.W * z] = 1;
     }
   }
 
-  marker(x, z, yaw, color) {
-    const ctx = this.ctx;
-    const mx = Math.round((x / CELL) * K), mz = Math.round((z / CELL) * K);
-    ctx.fillStyle = '#000';
-    ctx.fillRect(mx - 3, mz - 3, 6, 6);
-    ctx.fillStyle = color;
-    ctx.fillRect(mx - 2, mz - 2, 4, 4);
-    if (yaw !== undefined) {                                       // facing: a 2x2 "nose" pixel ahead of the dot
-      ctx.fillStyle = '#fff';
-      ctx.fillRect(mx + Math.round(Math.sin(yaw) * 5) - 1, mz + Math.round(-Math.cos(yaw) * 5) - 1, 2, 2);
+  // Rotate the base map into the VIEW x VIEW window (nearest-neighbour, so pixels stay crisp).
+  // Screen x = player's right, screen up = player's forward.
+  renderView(cx, cz, yaw) {
+    const { W, H, explored } = this;
+    const src = this.img.data, dst = this.vimg.data;
+    const c = Math.cos(yaw), sn = Math.sin(yaw);
+    const half = VIEW / 2;
+    for (let oy = 0; oy < VIEW; oy++) for (let ox = 0; ox < VIEW; ox++) {
+      const dx = ox + 0.5 - half, dy = oy + 0.5 - half;
+      const wx = Math.floor(cx + c * dx - sn * dy);
+      const wz = Math.floor(cz + sn * dx + c * dy);
+      const o = (ox + VIEW * oy) * 4;
+      if (wx < 0 || wz < 0 || wx >= W || wz >= H || (explored && !explored[wx + W * wz])) {
+        dst[o] = 6; dst[o + 1] = 6; dst[o + 2] = 8; dst[o + 3] = 255;     // outside the map / unexplored
+      } else {
+        const i = (wx + W * wz) * 4;
+        dst[o] = src[i]; dst[o + 1] = src[i + 1]; dst[o + 2] = src[i + 2]; dst[o + 3] = 255;
+      }
     }
+    this.vctx.putImageData(this.vimg, 0, 0);
+  }
+
+  // Draw a dot at a window position (window pixels, centre = VIEW/2). rel = facing relative to the viewer.
+  dot(sx, sy, rel, color) {
+    const ctx = this.ctx, half = VIEW / 2;
+    const m = half - 2;
+    let x = sx, y = sy, edge = false;
+    if (Math.abs(x) > m || Math.abs(y) > m) {                        // off the window: pin to the frame
+      const k = m / Math.max(Math.abs(x), Math.abs(y));
+      x *= k; y *= k; edge = true;
+    }
+    const mx = Math.round((half + x) * K), my = Math.round((half + y) * K);
+    ctx.globalAlpha = edge ? 0.6 : 1;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(mx - 4, my - 4, 8, 8);
+    ctx.fillStyle = color;
+    ctx.fillRect(mx - 3, my - 3, 6, 6);
+    if (rel !== undefined && !edge) {                                // facing: a 3x3 "nose" ahead of the dot
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(mx + Math.round(Math.sin(rel) * 7) - 1, my + Math.round(-Math.cos(rel) * 7) - 1, 3, 3);
+    }
+    ctx.globalAlpha = 1;
   }
 
   // self = { x, z, yaw } in voxel coordinates (yaw 0 faces -Z, pi/2 faces +X, like the player).
   draw(self, time = 0) {
-    this.reveal(Math.floor(self.x / CELL), Math.floor(self.z / CELL));
-    const { ctx, W, H } = this;
-    ctx.clearRect(0, 0, W * K, H * K);
-    ctx.drawImage(this.base, 0, 0, W * K, H * K);
-    if (this.fog) ctx.drawImage(this.fogCanvas, 0, 0, W * K, H * K);
-    for (const m of this.markers) this.marker(m.x, m.z, m.yaw, m.color ?? '#ff4a4a');
-    this.marker(self.x, self.z, self.yaw, time % 1 < 0.5 ? '#ffd24a' : '#ff9a2a');
+    const cx = self.x / CELL, cz = self.z / CELL;
+    this.reveal(Math.floor(cx), Math.floor(cz));
+    this.renderView(cx, cz, self.yaw);
+
+    const { ctx } = this;
+    const size = VIEW * K, half = VIEW / 2;
+    ctx.clearRect(0, 0, size, size);
+    ctx.drawImage(this.view, 0, 0, size, size);
+
+    // other players, rotated into the window
+    const c = Math.cos(self.yaw), sn = Math.sin(self.yaw);
+    for (const m of this.markers) {
+      const rx = m.x / CELL - cx, rz = m.z / CELL - cz;
+      this.dot(c * rx + sn * rz, -(sn * rx - c * rz), m.yaw === undefined ? undefined : m.yaw - self.yaw, m.color ?? '#ff4a4a');
+    }
+    this.dot(0, 0, 0, time % 1 < 0.5 ? '#ffd24a' : '#ff9a2a');       // you: always at the centre, facing up
+
+    // north marker on the frame rim: north is world -Z
+    const nx = -sn, ny = -c;
+    const r = half - 5;
+    const k = r / Math.max(Math.abs(nx), Math.abs(ny));
+    const tx = (half + nx * k) * K, ty = (half + ny * k) * K;
+    ctx.font = 'bold 12px monospace';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#000'; ctx.fillText('N', tx + 1, ty + 1);
+    ctx.fillStyle = '#ff6a5a'; ctx.fillText('N', tx, ty);
   }
 }
