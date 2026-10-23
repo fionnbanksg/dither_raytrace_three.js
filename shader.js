@@ -180,7 +180,7 @@ vec3 shade(Hit h, vec3 ro, vec3 rd) {
   float ao  = faceAO(h.cell, h.n, p);
   vec3  lit = alb * vec3(0.6, 0.7, 1.0) * uAmbient * ao;
 
-  vec3 sp = p + h.n * 0.02;                                  // shadow ray origin
+  vec3 sp = p + h.n * 0.3;                                  // shadow ray origin
   for (int i = 0; i < 8; i++) {
     if (i >= uLightCount) break;
 
@@ -200,7 +200,8 @@ vec3 shade(Hit h, vec3 ro, vec3 rd) {
       hash13(vec3(gl_FragCoord.xy, 1.0 + float(i))),
       hash13(vec3(gl_FragCoord.xy, 7.0 + float(i))),
       hash13(vec3(gl_FragCoord.xy, 13.0 + float(i)))) - 0.5;
-    vec3  target = uLightPos[i] + jit * uSoft;
+    vec3  target = uLightPos[i] + jit * (i == 0 ? 0.0 : uSoft);   // torch: hard shadow, other lights stay soft
+    if (solidAt(ivec3(floor(target)))) target = uLightPos[i];     // never aim a shadow ray into stone
     vec3  sd = target - sp;
     float sl = length(sd);
     if (occluded(sp, safeDir(sd), sl - 0.05)) continue;

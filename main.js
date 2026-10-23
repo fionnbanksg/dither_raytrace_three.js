@@ -2,6 +2,8 @@ import * as THREE from 'three';
 import { buildWorld, PALETTE, T } from './world.js';
 import { vert, frag } from './shader.js';
 import { Player } from './player.js';
+import { Input } from './input.js';
+import { createPhysics, FIXED_DT, TILE_M } from './physics.js';
 
 // ---------------------------------------------------------------- settings
 const INTERNAL_HEIGHT = 360;   // render resolution (width follows aspect ratio)
@@ -9,6 +11,7 @@ const DITHER_LEVELS   = 14;    // colour levels per channel (lower = grittier)
 const DITHER_STRENGTH = 0.7;   // 0 = flat banding, 1 = full Bayer pattern
 const FOV_DEG         = 70;    // vertical FOV
 const SHOW_DEBUG      = true;  // small readout in the top right (position, velocity, keys)
+const MAX_FRAME_DT    = 0.1;   // clamp to avoid a spiral of death after a tab switch
 
 // ---------------------------------------------------------------- renderer
 const canvas = document.getElementById('view');
@@ -37,6 +40,12 @@ const maxTex3D = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE);
 if (Math.max(world.size.x, world.size.y, world.size.z) > maxTex3D) {
   console.warn(`World is ${world.size.x}x${world.size.y}x${world.size.z} but this GPU's max 3D texture size is ${maxTex3D}. Lower T in world.js.`);
 }
+
+const solidVoxel = (x, y, z) => {
+  const ix = Math.floor(x), iy = Math.floor(y), iz = Math.floor(z);
+  if (ix < 0 || iy < 0 || iz < 0 || ix >= world.size.x || iy >= world.size.y || iz >= world.size.z) return true;
+  return world.data[ix + world.size.x * (iy + world.size.y * iz)] !== 0;
+};
 
 const palette = Array.from({ length: 8 }, (_, i) => new THREE.Vector3(...(PALETTE[i] ?? [1, 0, 1])));
 
@@ -97,42 +106,75 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
-// ---------------------------------------------------------------- player
-const player = new Player(world, canvas, world.start);
-// tweak the feel here, e.g. new Player(world, canvas, world.start, { walkSpeed: 3 * T, jumpHeight: 0.25 * T })
+// ---------------------------------------------------------------- physics + player
+const physics = await createPhysics(world);   // collision mesh + Rapier world (a second or two)
+
+const spawn = { x: (world.start.tx + 0.5) * TILE_M, y: 0, z: (world.start.tz + 0.5) * TILE_M };
+const player = new Player(physics, spawn);    // tweak the feel: new Player(physics, spawn, { walkSpeed: 5, jumpHeight: 1.3 })
+const input = new Input(canvas, { yaw: Math.PI / 2 });   // start facing down the first corridor (+X)
 
 const hint = document.getElementById('hint');
-if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly · Esc release mouse';
+if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · Esc release mouse';
 const debugEl = document.getElementById('debug');
 
 // ---------------------------------------------------------------- loop
 let last = performance.now();
+let acc = 0;
+const eye = new THREE.Vector3();
+let torchK = 1;   // 0 = torch at the eye, 1 = full offset
 function frame(now) {
-  const dt = (now - last) / 1000;
+  const dt = Math.min(MAX_FRAME_DT, (now - last) / 1000);
   last = now;
   const time = now / 1000;
   uniforms.uTime.value = time;
 
-  player.update(dt);
-  const e = player.eye;
-  uniforms.uCamPos.value.set(e.x, e.y, e.z);
-  uniforms.uCamFwd.value.set(...player.forward);
-  uniforms.uCamRight.value.set(...player.right);
-  uniforms.uCamUp.value.set(...player.up);
-  player.torchPosition(lightPos[0]);
+  // fixed-timestep simulation (60 Hz), render interpolates between ticks
+  input.frameUpdate(dt);
+  acc += dt;
+  while (acc >= FIXED_DT) {
+    player.tick(input.sample());
+    acc -= FIXED_DT;
+  }
+  player.alpha = acc / FIXED_DT;
+  player.frameUpdate(dt);
+
+  // camera uses the freshest look angles, not the last tick's
+  const { forward, right, up } = Player.basis(input.yaw, input.pitch);
+  player.eyeVoxels(eye);
+  uniforms.uCamPos.value.copy(eye);
+  uniforms.uCamFwd.value.set(...forward);
+  uniforms.uCamRight.value.set(...right);
+  uniforms.uCamUp.value.set(...up);
+
+  // torch: held to the right of the eye, pulled back if it would end up inside stone
+  const o = player.o;
+  const mv = T / TILE_M;
+  const dx = right[0] * o.torchRight * mv, dy = o.torchUp * mv, dz = right[2] * o.torchRight * mv;
+  let target = 1;
+  for (let i = 1; i <= 12; i++) {                      // slide back along the offset to just before any stone
+    const f = i / 12;
+    if (solidVoxel(eye.x + dx * f, eye.y + dy * f, eye.z + dz * f)) {
+      target = Math.max(0, (i - 1) / 12 - 3 / Math.hypot(dx, dy, dz));   // 3 voxel margin
+      break;
+    }
+  }
+  torchK = target < torchK ? target : torchK + (target - torchK) * (1 - Math.exp(-20 * dt));   // retract instantly, ease back out
+  lightPos[0].set(eye.x + dx * torchK, eye.y + dy * torchK, eye.z + dz * torchK);
 
   // flicker
-  lightCol[0].copy(torchBase).multiplyScalar(1 + 0.06 * Math.sin(time * 9) + 0.04 * Math.sin(time * 23));
+  lightCol[0].copy(torchBase).multiplyScalar(1 + 0.02 * Math.sin(time * 9));
   staticLights.forEach((l, i) => {
     lightCol[i + 1].copy(l.base).multiplyScalar(1 + 0.10 * Math.sin(time * 7 + i * 2.3) + 0.06 * Math.sin(time * 19 + i));
   });
 
   if (SHOW_DEBUG && debugEl) {
+    const fy = player.y - player.centreOffset;
     debugEl.textContent =
-      `pos ${player.x.toFixed(1)} ${player.y.toFixed(1)} ${player.z.toFixed(1)}\n` +
-      `vel ${player.vx.toFixed(1)} ${player.vy.toFixed(1)} ${player.vz.toFixed(1)}\n` +
-      `${player.onGround ? 'ground' : 'air'}${player.fly ? ' · fly' : ''}\n` +
-      `keys ${[...player.keys].join(' ') || '-'}`;
+      `pos ${player.x.toFixed(2)} ${fy.toFixed(2)} ${player.z.toFixed(2)} m\n` +
+      `vel ${player.vx.toFixed(2)} ${player.vy.toFixed(2)} ${player.vz.toFixed(2)}\n` +
+      `${player.onGround ? 'ground' : 'air'}${player.fly ? ' · fly' : ''}${input.locked ? '' : ' · click to capture mouse'}\n` +
+      `keys ${[...input.keys].join(' ') || '-'}\n` +
+      `${physics.triangles} collision tris`;
   }
 
   renderer.render(scene, camera);
