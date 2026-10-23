@@ -7,13 +7,14 @@ import { createPhysics, FIXED_DT, TILE_M, M2V, mToVoxX, mToVoxY, mToVoxZ } from 
 import { explode, raycastVoxels, voxelAt, warmUp } from './destruction.js';
 import { Particles, MAX_PARTICLES, TEXELS } from './particles.js';
 import { Projectiles } from './projectiles.js';
+import { DebugOverlay } from './debug.js';
 
 // ---------------------------------------------------------------- settings
 const INTERNAL_HEIGHT = 360;   // render resolution (width follows aspect ratio)
 const DITHER_LEVELS   = 14;    // colour levels per channel (lower = grittier)
 const DITHER_STRENGTH = 0.7;   // 0 = flat banding, 1 = full Bayer pattern
 const FOV_DEG         = 70;    // vertical FOV
-const SHOW_DEBUG      = true;  // small readout in the top right (position, velocity, keys)
+const SHOW_DEBUG      = false; // start with the F3 debug overlay open
 const MAX_FRAME_DT    = 0.1;   // clamp to avoid a spiral of death after a tab switch
 const BLAST_RADIUS_M  = 2.0;   // left click: crater radius in metres (a tile is 4 m wide)
 const BIG_BLAST_MUL   = 1.8;   // right click: bigger blast
@@ -151,8 +152,53 @@ const player = new Player(physics, spawn);    // tweak the feel: new Player(phys
 const input = new Input(canvas, { yaw: Math.PI / 2 });   // start facing down the first corridor (+X)
 
 const hint = document.getElementById('hint');
-if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · Esc release mouse · Click: fire grenade · Right click: heavy shell (hold to keep firing)';
+if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · F3 debug · Esc release mouse · Click: fire grenade · Right click: heavy shell (hold to keep firing)';
+
+// ---------------------------------------------------------------- F3 debug overlay
+const stats = { shots: 0, blasts: 0, lastBlast: null };   // counters updated by shoot() / detonate()
+const GL_DEBUG = gl.getExtension('WEBGL_debug_renderer_info');
+const gpuName = GL_DEBUG ? gl.getParameter(GL_DEBUG.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+const MATERIALS = ['air', 'stone', 'grass', 'dungeon floor', 'wood', 'brick', 'flame', 'scorched stone'];
+const COMPASS = ['N (-Z)', 'NE', 'E (+X)', 'SE', 'S (+Z)', 'SW', 'W (-X)', 'NW'];
 const debugEl = document.getElementById('debug');
+const debug = debugEl && new DebugOverlay(debugEl, () => {
+  const { forward } = Player.basis(input.yaw, input.pitch);
+  player.eyeVoxels(eye);
+  const hit = raycastVoxels(world, [eye.x, eye.y, eye.z], forward, 400 * M2V);
+  const yawDeg = ((THREE.MathUtils.radToDeg(input.yaw) % 360) + 360) % 360;
+  const heading = Math.atan2(forward[0], -forward[2]);                    // 0 = facing -Z, like the player's yaw
+  const r = canvas.getBoundingClientRect();
+  return {
+    gpu: gpuName, calls: renderer.info.render.calls, maxTex3D, fov: FOV_DEG, levels: DITHER_LEVELS, ditherStrength: DITHER_STRENGTH,
+    res: [uniforms.uRes.value.x, uniforms.uRes.value.y], canvas: [Math.round(r.width), Math.round(r.height)],
+    upscale: (r.height / uniforms.uRes.value.y).toFixed(2),
+    lights: uniforms.uLightCount.value, maxLights: MAX_LIGHTS, flashes: flashes.length,
+    pos: [player.x, player.y - player.centreOffset, player.z],
+    tile: [Math.floor(player.x / TILE_M), Math.floor(player.z / TILE_M)],
+    voxel: [eye.x, eye.y, eye.z],
+    vel: [player.vx, player.vy, player.vz], speed: Math.hypot(player.vx, player.vy, player.vz),
+    yaw: yawDeg, pitch: THREE.MathUtils.radToDeg(input.pitch),
+    facing: COMPASS[Math.round(((heading + Math.PI * 2) % (Math.PI * 2)) / (Math.PI / 4)) % 8],
+    state: `${player.onGround ? 'on ground' : 'airborne'}${player.fly ? ' · fly' : ''}`, locked: input.locked,
+    look: hit ? { id: voxelAt(world, ...hit.cell), name: MATERIALS[voxelAt(world, ...hit.cell)] ?? '?', cell: hit.cell, dist: hit.t / M2V } : null,
+    shots: stats.shots, blasts: stats.blasts, lastBlast: stats.lastBlast, inFlight: projectiles.list.length,
+    cooldown: gunCooldown, shake,
+    particles: particles.count, packed: particles.packed, maxParticles: MAX_PARTICLES,
+    world: {
+      size: [world.size.x, world.size.y, world.size.z],
+      metres: [world.size.x, world.size.y, world.size.z].map((v) => (v / M2V).toFixed(1)),
+      mb: world.data.length / 1e6, bricks: [world.coarseSize.x, world.coarseSize.y, world.coarseSize.z],
+      tileVox: T, tileM: TILE_M,
+    },
+    tris: physics.triangles,
+    heap: performance.memory ? performance.memory.usedJSHeapSize / 1048576 : null,
+    time: performance.now() / 1000,
+  };
+});
+if (debug && SHOW_DEBUG) debug.toggle();
+addEventListener('keydown', (e) => {
+  if (e.code === 'F3') { e.preventDefault(); if (!e.repeat) debug?.toggle(); }
+});
 
 
 // ---------------------------------------------------------------- explosions
@@ -185,6 +231,7 @@ function detonate(point, normal, radiusM) {
   const R = radiusM * M2V;                                    // metres -> voxels
   const c = point.map((p, i) => p + normal[i] * R * 0.3);     // nudge out of the wall so the crater opens into the room
   const debris = [];
+  const t0 = performance.now();
   const box = explode(world, c, R, {
     keepClear: [{ x: mToVoxX(player.x), z: mToVoxZ(player.z), r: 0.9 * M2V }],   // no rubble under the player's feet
     debrisOut: debris, debrisMax: DEBRIS_PER_BLAST,
@@ -194,11 +241,13 @@ function detonate(point, normal, radiusM) {
     uploadVoxelBox(box);
     coarseTex.needsUpdate = true;                             // 157 KB, cheap to re-upload whole
     physics.updateRegion(box);
+    stats.lastBlast = { dims: `${box.x1 - box.x0}x${box.y1 - box.y0}x${box.z1 - box.z0}`, ms: performance.now() - t0 };
 
     // braziers whose flame voxel was destroyed go out
     staticLights.forEach((l) => { if (!l.dead && voxelAt(world, ...l.anchor) !== 6) l.dead = true; });
   }
 
+  stats.blasts++;
   particles.burst(c, normal[0] || normal[1] || normal[2] ? normal : [0, 1, 0], radiusM / BLAST_RADIUS_M, debris);
 
   // light flash + knockback
@@ -259,6 +308,7 @@ function shoot(shot) {
     dir[2] * sp + player.vz * M2V * INHERIT_VELOCITY,
   ], { gravity: shot.gravity * M2V, radiusM: shot.radiusM, big: shot.big });
 
+  stats.shots++;
   gunCooldown = shot.cooldown;
   gunKick = Math.max(gunKick, shot.kick);
   gunMuzzle = 1;
@@ -272,7 +322,9 @@ let shake = 0;    // camera shake, decays after a blast
 let particlesLive = false;
 let torchK = 1;   // 0 = torch at the eye, 1 = full offset
 function frame(now) {
-  const dt = Math.min(MAX_FRAME_DT, (now - last) / 1000);
+  const cpuStart = performance.now();
+  const rawMs = now - last;
+  const dt = Math.min(MAX_FRAME_DT, rawMs / 1000);
   last = now;
   const time = now / 1000;
   uniforms.uTime.value = time;
@@ -380,17 +432,8 @@ function frame(now) {
     particlesLive = particles.count > 0 || shells.length > 0;
   }
 
-  if (SHOW_DEBUG && debugEl) {
-    const fy = player.y - player.centreOffset;
-    debugEl.textContent =
-      `pos ${player.x.toFixed(2)} ${fy.toFixed(2)} ${player.z.toFixed(2)} m\n` +
-      `vel ${player.vx.toFixed(2)} ${player.vy.toFixed(2)} ${player.vz.toFixed(2)}\n` +
-      `${player.onGround ? 'ground' : 'air'}${player.fly ? ' · fly' : ''}${input.locked ? '' : ' · click to capture mouse'}\n` +
-      `keys ${[...input.keys].join(' ') || '-'}\n` +
-      `${physics.triangles} collision tris · ${particles.count} particles`;
-  }
-
   renderer.render(scene, camera);
+  debug?.frame(rawMs, performance.now() - cpuStart);
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
