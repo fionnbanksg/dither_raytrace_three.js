@@ -19,10 +19,11 @@ export const DEFAULTS = {
   airAccel: 14,           // air control
   airDecel: 1.2,          // light drag in the air
 
-  jumpHeight: 1.1,        // metres
-  gravity: 22,            // rising
-  fallGravityMul: 1.6,    // heavier on the way down
-  jumpCut: 0.5,           // vertical speed multiplier when jump is released early
+  jumpHeight: 1.3,        // metres, full (held) jump
+  gravity: 20,            // rising
+  fallGravityMul: 1.5,    // heavier on the way down
+  jumpCut: 0.6,           // one-off vertical speed multiplier when jump is released early (tap = ~0.45 m hop)
+  jumpCutDelay: 0.09,     // seconds after take-off before a release can cut the jump (so quick taps still hop)
   maxFallSpeed: 40,
   coyoteTime: 0.10,
   jumpBuffer: 0.12,
@@ -73,6 +74,7 @@ export class Player {
     this.fly = false;
     this.coyote = 0;
     this.buffer = 0;
+    this.jumpAge = 0; this.cutDone = true;
     this.launched = false;    // true after knock(): disables the short-hop cut until we start falling
     this.slopeBoost = 1;      // compensates the controller's slope shortening (see tick)
     this.stepOffset = 0;      // visual-only smoothing for step-ups
@@ -118,9 +120,13 @@ export class Player {
     if (this.buffer > 0 && this.coyote > 0) {
       this.vy = Math.sqrt(2 * o.gravity * o.jumpHeight);
       this.buffer = 0; this.coyote = 0; jumped = true;
+      this.jumpAge = 0; this.cutDone = false;
     }
     if (this.vy <= 0 || this.onGround) this.launched = false;
-    if (!intent.jumpHeld && this.vy > 0 && !jumped && !this.launched) this.vy *= Math.pow(o.jumpCut, dt * 60);   // short hop
+    this.jumpAge += dt;
+    if (!intent.jumpHeld && this.vy > 0 && !jumped && !this.launched && !this.cutDone && this.jumpAge >= o.jumpCutDelay) {
+      this.vy *= o.jumpCut; this.cutDone = true;      // short hop: applied once, not every tick
+    }
 
     // ---- gravity
     if (this.onGround && this.vy <= 0 && !jumped) this.vy = 0;

@@ -74,7 +74,8 @@ if (Math.max(world.size.x, world.size.y, world.size.z) > maxTex3D) {
 
 const solidVoxel = (x, y, z) => {
   const ix = Math.floor(x), iy = Math.floor(y), iz = Math.floor(z);
-  if (ix < 0 || iy < 0 || iz < 0 || ix >= world.size.x || iy >= world.size.y || iz >= world.size.z) return true;
+  if (ix < 0 || iy < 0 || iz < 0 || ix >= world.size.x || iz >= world.size.z) return true;
+  if (iy >= world.size.y) return false;               // open sky above the volume
   return world.data[ix + world.size.x * (iy + world.size.y * iz)] !== 0;
 };
 

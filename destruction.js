@@ -26,8 +26,10 @@ export function raycastVoxels(world, origin, dir, maxDist = 400) {
   let t = 0, nx = 0, ny = 0, nz = 0;
 
   while (t <= maxDist) {
-    if (x < 0 || y < 0 || z < 0 || x >= sx || y >= sy || z >= sz) return null;
-    if (data[x + sx * (y + sy * z)] !== 0) {
+    if (x < 0 || y < 0 || z < 0 || x >= sx || z >= sz) return null;
+    if (y >= sy) {                                       // above the voxel volume is open sky, not a wall
+      if (stepY > 0 && dir[1] > 0) return null;          // heading up and away: nothing more to hit
+    } else if (data[x + sx * (y + sy * z)] !== 0) {
       return {
         t, cell: [x, y, z], normal: [nx, ny, nz],
         point: [origin[0] + dir[0] * t, origin[1] + dir[1] * t, origin[2] + dir[2] * t],
@@ -114,7 +116,7 @@ export function explode(world, center, radius, opts = {}) {
 
   const idx = (x, y, z) => x + sx * (y + sy * z);
   const breakable = (x, y, z) =>
-    x >= MARGIN && z >= MARGIN && x < sx - MARGIN && z < sz - MARGIN && y >= 1 && y < sy - MARGIN;
+    x >= MARGIN && z >= MARGIN && x < sx - MARGIN && z < sz - MARGIN && y >= 1;   // no ceiling any more: the top of the volume is open sky
   const nf = 0.11;                      // noise frequency (voxels): lumps ~9 voxels across
 
   // radius field: shared by carve and scorch so the soot hugs the crater wall
@@ -150,7 +152,7 @@ export function explode(world, center, radius, opts = {}) {
   const reach2 = reach * reach;
   const exposed = (x, y, z) =>
     (x > 0 && data[idx(x - 1, y, z)] === 0) || (x < sx - 1 && data[idx(x + 1, y, z)] === 0) ||
-    (y > 0 && data[idx(x, y - 1, z)] === 0) || (y < sy - 1 && data[idx(x, y + 1, z)] === 0) ||
+    (y > 0 && data[idx(x, y - 1, z)] === 0) || (y >= sy - 1 || data[idx(x, y + 1, z)] === 0) ||
     (z > 0 && data[idx(x, y, z - 1)] === 0) || (z < sz - 1 && data[idx(x, y, z + 1)] === 0);
   for (let z = z0; z < z1; z++) for (let y = y0; y < y1; y++) {
     const dy = y + 0.5 - cy, dz = z + 0.5 - cz;
@@ -200,7 +202,8 @@ export function explode(world, center, radius, opts = {}) {
 export function voxelAt(world, x, y, z) {
   const { data, size } = world;
   x = Math.floor(x); y = Math.floor(y); z = Math.floor(z);
-  if (x < 0 || y < 0 || z < 0 || x >= size.x || y >= size.y || z >= size.z) return 1;
+  if (x < 0 || y < 0 || z < 0 || x >= size.x || z >= size.z) return 1;
+  if (y >= size.y) return 0;                             // open sky above the volume
   return data[x + size.x * (y + size.y * z)];
 }
 

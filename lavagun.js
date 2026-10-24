@@ -83,7 +83,7 @@ export class LavaGun {
         continue;
       }
       p.x += dx; p.y += dy; p.z += dz;
-      if (p.x < 0 || p.y < 0 || p.z < 0 || p.x >= sx || p.y >= sy || p.z >= sz || p.age > MAX_LIFE) list.splice(i, 1);
+      if (p.x < 0 || p.y < 0 || p.z < 0 || p.x >= sx || p.z >= sz || p.age > MAX_LIFE) list.splice(i, 1);
     }
   }
 

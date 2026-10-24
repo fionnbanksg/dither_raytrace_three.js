@@ -62,7 +62,7 @@ export class Projectiles {
 
       p.x += dx; p.y += dy; p.z += dz;
 
-      const outside = p.x < 0 || p.y < 0 || p.z < 0 || p.x >= sx || p.y >= sy || p.z >= sz;
+      const outside = p.x < 0 || p.y < 0 || p.z < 0 || p.x >= sx || p.z >= sz;
       if (outside) { list.splice(i, 1); continue; }
       if (p.age > MAX_LIFE) {                              // never hit anything: airburst
         list.splice(i, 1);

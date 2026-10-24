@@ -109,6 +109,15 @@ Hit noHit() {
 // Two-level grid traversal. rd must be normalised.
 // Outer loop walks 8^3 bricks; bricks that contain stone are walked voxel by voxel.
 Hit trace(vec3 ro, vec3 rd, int maxCoarse, float maxT) {
+  // Rays that start above the volume (player flying/launched high) first travel down to its top face.
+  float yOff = 0.0;
+  if (ro.y >= uSize.y) {
+    if (rd.y >= -1e-5) return noHit();
+    yOff = (ro.y - uSize.y + 1e-3) / -rd.y;
+    if (yOff >= maxT) return noHit();
+    ro += rd * yOff;
+    maxT -= yOff;
+  }
   vec3  stp  = sign(rd);
   vec3  inv  = 1.0 / rd;
   vec3  dlt  = abs(inv);
@@ -136,7 +145,7 @@ Hit trace(vec3 ro, vec3 rd, int maxCoarse, float maxT) {
         if (id > 0) {
           Hit h;
           h.hit = true; h.id = id; h.cell = cell;
-          h.t = dot(fmask, side - dlt);
+          h.t = dot(fmask, side - dlt) + yOff;
           h.n = -fmask * stp;
           return h;
         }

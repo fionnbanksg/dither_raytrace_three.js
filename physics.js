@@ -30,7 +30,8 @@ function cellIsSolid(world, cx, cy, cz) {
   for (let z = cz * CELL_VOX; z < cz * CELL_VOX + CELL_VOX; z++) {
     for (let y = 1 + cy * CELL_VOX; y < 1 + cy * CELL_VOX + CELL_VOX; y++) {
       for (let x = cx * CELL_VOX; x < cx * CELL_VOX + CELL_VOX; x++) {
-        if (x >= sx || y >= sy || z >= sz) { count++; continue; }   // outside the world counts as stone
+        if (x >= sx || z >= sz) { count++; continue; }   // outside the world's sides counts as stone
+        if (y >= sy) continue;                           // above the top is open air
         const id = data[x + sx * (y + sy * z)];
         if (id !== 0 && id !== GRASS && id !== LAVA && id !== LEAF) count++;                      // grass above the floor is walk-through
       }
@@ -87,7 +88,8 @@ export function greedyMesh({ solid, nx, ny, nz }, region) {
   const hi = region ? region.hi : [nx, ny, nz];
   const at = (x, y, z) => {
     if (y < 0) return 1;                                   // ground slab below cell row 0
-    if (x < 0 || z < 0 || x >= nx || z >= nz || y >= ny) return 1;
+    if (x < 0 || z < 0 || x >= nx || z >= nz) return 1;
+    if (y >= ny) return 0;                                 // no ceiling: open sky above the grid
     return solid[x + nx * (y + ny * z)];
   };
 
