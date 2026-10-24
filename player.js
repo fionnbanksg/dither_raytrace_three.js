@@ -201,7 +201,7 @@ export class Player {
     if (Math.abs(this.stepOffset) < 1e-4) this.stepOffset = 0;
   }
 
-  // Camera basis from the current look angles (any yaw/pitch, e.g. the freshest mouse values).
+   // Camera basis from the current look angles (any yaw/pitch, e.g. the freshest mouse values).
   static basis(yaw, pitch) {
     const cp = Math.cos(pitch), sp = Math.sin(pitch), sy = Math.sin(yaw), cy = Math.cos(yaw);
     const forward = [sy * cp, sp, -cy * cp];
