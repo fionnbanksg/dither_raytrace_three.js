@@ -10,6 +10,7 @@ import { Projectiles } from './projectiles.js';
 import { DebugOverlay } from './debug.js';
 import { Minimap } from './minimap.js';
 import { LavaSim } from './lava.js';
+import { skyState, SkyClock } from './sky.js';
 import { LavaGlow, warmUpGlow } from './lavaglow.js';
 import { LavaGun } from './lavagun.js';
 
@@ -89,6 +90,12 @@ glowTex.minFilter = glowTex.magFilter = THREE.LinearFilter;   // trilinear: smoo
 glowTex.unpackAlignment = 1;
 glowTex.needsUpdate = true;
 
+// Day / night clock. ?time=0.3 sets the start (0 sunrise, .25 noon, .5 sunset, .75 midnight), ?day=240 the cycle length in seconds (0 = frozen).
+const num = (k, d) => (Number.isFinite(parseFloat(params.get(k))) ? parseFloat(params.get(k)) : d);
+const skyClock = new SkyClock(num('time', 0.3), num('day', 240));
+const v3 = (a) => new THREE.Vector3(...a);
+const skyU = skyState(skyClock.tod);
+
 const palette = Array.from({ length: 10 }, (_, i) => new THREE.Vector3(...(PALETTE[i] ?? [1, 0, 1])));
 
 // Lights: index 0 is the player's torch (follows the camera), the rest come from the world.
@@ -145,7 +152,20 @@ const uniforms = {
   uGlowCol: { value: LAVA_GLOW_COL },
   uGlowScale: { value: lavaGlow.max },
   uGlowTexel: { value: lavaGlow.G },
+  uSunDir: { value: v3(skyU.sunDir) }, uMoonDir: { value: v3(skyU.moonDir) },
+  uCelLightDir: { value: v3(skyU.lightDir) }, uCelLightCol: { value: v3(skyU.lightCol) },
+  uSkyAmb: { value: v3(skyU.skyAmb) }, uZenith: { value: v3(skyU.zenith) }, uHorizon: { value: v3(skyU.horizon) },
+  uDusk: { value: v3(skyU.dusk) }, uSunDisc: { value: v3(skyU.sunDisc) },
+  uNight: { value: skyU.night }, uSkyRot: { value: new THREE.Vector2(...skyU.rot) },
 };
+
+function applySky(st) {
+  uniforms.uSunDir.value.set(...st.sunDir); uniforms.uMoonDir.value.set(...st.moonDir);
+  uniforms.uCelLightDir.value.set(...st.lightDir); uniforms.uCelLightCol.value.set(...st.lightCol);
+  uniforms.uSkyAmb.value.set(...st.skyAmb); uniforms.uZenith.value.set(...st.zenith); uniforms.uHorizon.value.set(...st.horizon);
+  uniforms.uDusk.value.set(...st.dusk); uniforms.uSunDisc.value.set(...st.sunDisc);
+  uniforms.uNight.value = st.night; uniforms.uSkyRot.value.set(...st.rot);
+}
 
 const material = new THREE.ShaderMaterial({
   glslVersion: THREE.GLSL3,
@@ -188,7 +208,7 @@ if (mapCap) mapCap.textContent = `SEED ${seed}`;
 
 const hint = document.getElementById('hint');
 const modeEl = document.getElementById('mapcap');   // reuse the caption under the minimap for the gun mode
-if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · M map · F3 debug · Esc release mouse · Shift+L: clear lava · Scroll wheel (or G): swap grenades / LAVA GUN · Click: fire (lava gun: hold to spray) · Right click: heavy shell (hold to keep firing)';
+if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · M map · T time of day (normal / fast / paused) · F3 debug · Esc release mouse · Shift+L: clear lava · Scroll wheel (or G): swap grenades / LAVA GUN · Click: fire (lava gun: hold to spray) · Right click: heavy shell (hold to keep firing)';
 
 // ---------------------------------------------------------------- F3 debug overlay
 const stats = { shots: 0, blasts: 0, lastBlast: null };   // counters updated by shoot() / detonate()
@@ -234,6 +254,7 @@ const debug = debugEl && new DebugOverlay(debugEl, () => {
 if (debug && SHOW_DEBUG) debug.toggle();
 addEventListener('keydown', (e) => {
   if (e.code === 'KeyM' && !e.repeat) minimap?.toggle();
+  if (e.code === 'KeyT' && !e.repeat) { const m = skyClock.cycle(); const h = document.getElementById('hint'); if (h) { const old = h.textContent; h.textContent = 'Time: ' + m; setTimeout(() => { h.textContent = old; }, 1500); } }
   if (e.code === 'F3') { e.preventDefault(); if (!e.repeat) debug?.toggle(); }
 });
 
@@ -395,6 +416,8 @@ function frame(now) {
   last = now;
   const time = now / 1000;
   uniforms.uTime.value = time;
+  skyClock.update(dt);
+  applySky(skyState(skyClock.tod));
 
   // fixed-timestep simulation (60 Hz), render interpolates between ticks
   input.frameUpdate(dt);

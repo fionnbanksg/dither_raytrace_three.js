@@ -45,11 +45,12 @@ export class LavaSim {
     cap = 1.25,          // max volume of a cell (>1 = compressible)
     dropVol = 1.0,       // volume one gun droplet adds when it lands
     sourceRate = 0.5,    // volume per tick per nozzle column for addSource()
+    momentum = 0.6,      // how much of a droplet's sideways speed becomes flux in the grid (0 = none)
   } = {}) {
     this.world = world;
     this.C = cell; this.width = width;
     this.g = gravity; this.kL = flow; this.kP = pressure; this.yieldH = yieldH; this.damp = damp; this.cap = cap;
-    this.dropVol = dropVol; this.sourceRate = sourceRate;
+    this.dropVol = dropVol; this.sourceRate = sourceRate; this.momentum = momentum;
 
     const { x, y, z } = world.size;
     this.gx = Math.floor(x / cell);
@@ -180,7 +181,9 @@ export class LavaSim {
   // A droplet landed at `point` (voxels) on a surface with `normal`: pour its volume into the free cell just off
   // the surface; if that one is full (the pile is already there) climb, then try the neighbours, so a steady
   // stream builds a heap that the solver then slumps into a pool.
-  splat(point, normal, vol = this.dropVol) {
+  // `vel` (voxels/s, optional) is the droplet's velocity: its part along the surface is handed to the grid as
+  // flux on the cell's side faces, so a stream pushes lava along the floor, up slopes and down walls.
+  splat(point, normal, vel = null, vol = this.dropVol) {
     const C = this.C;
     const px = point[0] + normal[0] * C * 0.5, py = point[1] + normal[1] * C * 0.5, pz = point[2] + normal[2] * C * 0.5;
     const [cx, cy, cz] = this.cellOfVoxel(px, py, pz);
@@ -192,10 +195,32 @@ export class LavaSim {
         const i = this.idx(x, y, z);
         if (this.solid[i] || this.vol[i] + vol > this.cap) continue;
         this.addVolume(i, vol);
+        if (vel && this.momentum > 0) this.kick(i, x, y, z, normal, vel, vol);
         return true;
       }
     }
     return false;
+  }
+  // push flux through the faces of cell i: tangential part of the velocity only (the normal part hit the surface)
+  kick(i, cx, cy, cz, normal, vel, vol) {
+    const dn = vel[0] * normal[0] + vel[1] * normal[1] + vel[2] * normal[2];
+    const per = this.momentum * vol / (this.C * 30);                // voxels/s -> cells/tick, scaled by volume + strength
+    const t = this.tick;
+    for (let ax = 0; ax < 3; ax++) {
+      const vt = (vel[ax] - dn * normal[ax]) * per;
+      if (Math.abs(vt) < 1e-3) continue;
+      const pos = vt > 0;
+      const c = ax === 0 ? cx : ax === 1 ? cy : cz, lim = ax === 0 ? this.gx : ax === 1 ? this.gy : this.gz;
+      if (pos ? c + 1 >= lim : c - 1 < 0) continue;
+      const stride = ax === 0 ? 1 : ax === 1 ? this.gx : this.gxy;
+      const j = pos ? i + stride : i - stride;
+      if (this.solid[j]) continue;
+      const key = ax * this.n + (pos ? i : j);
+      const cur = this.S[key] === t ? this.F[key] : 0;           // add to a kick already given this tick
+      const f = Math.max(-0.6, Math.min(0.6, cur + vt));
+      this.F[key] = f; this.S[key] = t;                          // step() reads S === tick - 1 after incrementing
+      this.wakeAround(j);
+    }
   }
   clear() {
     for (const i of [...this.all]) {

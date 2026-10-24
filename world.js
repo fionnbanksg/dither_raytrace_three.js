@@ -26,7 +26,7 @@ export const PALETTE = [
 ];
 
 // ---------------------------------------------------------------- procedural layout
-// Tile legend:  '#' wall   '.' floor   'g' grass floor   'B' timber doorway   'L' brazier
+// Tile legend:  '#' wall   '.' floor   'g' grass floor   'o' open-air grass (no roof, sky above)   'B' timber doorway   'L' brazier
 //
 // The layout is a pure function of the seed, so every multiplayer client that is given the same
 // seed builds exactly the same level (the server only has to send one integer).
@@ -40,6 +40,7 @@ export function isWalkable(tx, tz) {
   const row = MAP[tz];
   return !!row && row[tx] !== undefined && row[tx] !== '#' && row[tx] !== 'L';
 }
+export const isOutdoor = (tx, tz) => !!MAP[tz] && MAP[tz][tx] === 'o';
 const openTile = (tx, tz) => !!MAP[tz] && MAP[tz][tx] !== undefined && MAP[tz][tx] !== '#';
 
 function mulberry32(a) {
@@ -186,6 +187,16 @@ function buildLayout(seed, W, H) {
     for (let z = r.z; z < r.z + r.h; z++) for (let x = r.x; x < r.x + r.w; x++) if (g[z][x] === '.') g[z][x] = 'g';
   });
 
+  // 6b. open-air courtyards: one big room (and maybe a mid one) lose their roof. Uses its own rng so the
+  //     rest of the layout stays the same for a given seed.
+  const orng = mulberry32((seed ^ 0x51ED270B) >>> 0);
+  const bigs = rooms.filter((r) => r.kind === 'big'), mids = rooms.filter((r) => r.kind === 'mid');
+  const outdoor = [bigs[Math.floor(orng() * bigs.length)]];
+  if (mids.length && orng() < 0.5) outdoor.push(mids[Math.floor(orng() * mids.length)]);
+  for (const r of outdoor) {
+    for (let z = r.z; z < r.z + r.h; z++) for (let x = r.x; x < r.x + r.w; x++) if (g[z][x] === '.' || g[z][x] === 'g') g[z][x] = 'o';
+  }
+
   // 7. braziers in room corners (big rooms first)
   const corners = (r) => shuffle([[r.x, r.z], [r.x + r.w - 1, r.z], [r.x, r.z + r.h - 1], [r.x + r.w - 1, r.z + r.h - 1]]);
   const lamps = [];
@@ -212,7 +223,7 @@ function buildLayout(seed, W, H) {
 
   // 9. spawn points: farthest-point sampling over plain floor tiles so players start well apart
   const floor = [];
-  for (let z = 0; z < H; z++) for (let x = 0; x < W; x++) if (g[z][x] === '.' || g[z][x] === 'g') floor.push([x, z]);
+  for (let z = 0; z < H; z++) for (let x = 0; x < W; x++) if (g[z][x] === '.' || g[z][x] === 'g' || g[z][x] === 'o') floor.push([x, z]);
   const picks = [floor[Math.floor(rnd() * floor.length)]];
   while (picks.length < Math.min(SPAWN_COUNT, floor.length)) {
     let best = null;
@@ -283,7 +294,8 @@ export function buildWorld(seed = 1337) {
     for (let lz = 0; lz < T; lz++) for (let lx = 0; lx < T; lx++) {
       const b = idx(tx * T + lx, 0, tz * T + lz);
       data[b] = 3;                                      // floor
-      for (let y = 1; y <= OPEN_H; y++) data[b + y * sx] = 0;
+      const top = ch === 'o' ? sy - 1 : OPEN_H;         // open-air tiles have no roof: air all the way up, so rays escape to the sky
+      for (let y = 1; y <= top; y++) data[b + y * sx] = 0;
     }
   }
 
@@ -319,10 +331,12 @@ export function buildWorld(seed = 1337) {
     if (!openTile(tx, tz)) continue;
     const x0 = tx * T, z0 = tz * T;
 
-    // walls
+    // walls (outdoors they are cliffs: eroded all the way up)
+    const outdoor = MAP[tz][tx] === 'o';
+    const wallTop = outdoor ? sy - 2 : OPEN_H;
     for (const [dx, dz] of DIRS) {
       if (openTile(tx + dx, tz + dz)) continue;
-      for (let a = 0; a < T; a++) for (let y = 1; y <= OPEN_H; y++) {
+      for (let a = 0; a < T; a++) for (let y = 1; y <= wallTop; y++) {
         const bx = dx > 0 ? x0 + T - 1 : dx < 0 ? x0 : x0 + a;   // boundary voxel inside the open tile
         const bz = dz > 0 ? z0 + T - 1 : dz < 0 ? z0 : z0 + a;
         const c = carveAmt(bx, y, bz);
@@ -337,6 +351,7 @@ export function buildWorld(seed = 1337) {
       const x = x0 + lx, z = z0 + lz;
       const ff = fillAmt(x, 0, z) * 0.7;
       for (let k = 0; k + 1 <= ff; k++) setStone(x, 1 + k, z);
+      if (outdoor) continue;                                   // no ceiling to erode
       const cc = carveAmt(x, OPEN_H + 1, z);
       for (let k = 1; k <= cc; k++) setAir(x, OPEN_H + k, z);
       const cf = fillAmt(x, OPEN_H + 1, z);
@@ -348,7 +363,7 @@ export function buildWorld(seed = 1337) {
   for (let z = 0; z < sz; z++) for (let x = 0; x < sx; x++) {
     const tx = (x / T) | 0, tz = (z / T) | 0;
     if (!openTile(tx, tz) || data[idx(x, 0, z)] === 0) continue;
-    const grassy = MAP[tz][tx] === 'g' || vnoise((x * 0.07) / S, 0, (z * 0.07) / S, seed + 5) > 0.68;
+    const grassy = MAP[tz][tx] === 'g' || (MAP[tz][tx] === 'o' && vnoise((x * 0.05) / S, 3, (z * 0.05) / S, seed + 21) > 0.3) || vnoise((x * 0.07) / S, 0, (z * 0.07) / S, seed + 5) > 0.68;
     if (!grassy) continue;
     data[idx(x, 0, z)] = 2;
     const r = hash3(Math.floor(x / S), 0, Math.floor(z / S), seed + 9);

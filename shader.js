@@ -40,6 +40,19 @@ uniform sampler3D uGlow;        // light thrown by resting lava, R8, one texel =
 uniform vec3  uGlowCol;         // glow colour * strength
 uniform float uGlowScale;       // field value that byte 255 stands for
 uniform float uGlowTexel;       // voxels per glow texel
+uniform vec3  uSunDir;          // see sky.js
+uniform vec3  uMoonDir;
+uniform vec3  uCelLightDir;        // the one directional light that is on (sun by day, moon by night)
+uniform vec3  uCelLightCol;     // its colour * intensity (0 at the horizon)
+uniform vec3  uSkyAmb;          // ambient light from open sky
+uniform vec3  uZenith;
+uniform vec3  uHorizon;
+uniform vec3  uDusk;            // warm glow around the sun at sunrise / sunset
+uniform vec3  uSunDisc;
+uniform float uNight;           // 0 day .. 1 night: star visibility
+uniform vec2  uSkyRot;          // cos, sin of the star-field rotation
+
+float gSky = 0.0;               // sky visibility of the last lit surface (0 indoors): drives distance fog colour
 
 layout(location = 0) out highp vec4 fragColor;
 
@@ -185,8 +198,28 @@ vec3 albedo(int id, ivec3 cell) {
 }
 
 vec3 sky(vec3 rd) {
-  float star = step(0.9975, hash13(floor(rd * 160.0)));
-  return vec3(0.008, 0.012, 0.03) + star * 0.7;
+  float h = clamp(rd.y, 0.0, 1.0);
+  vec3 c = mix(uHorizon, uZenith, pow(h, 0.55));
+
+  float sd = dot(rd, uSunDir);
+  c += uDusk * pow(max(sd, 0.0), 5.0) * (1.0 - h * 0.7);              // glow around the sun at dusk / dawn
+  c += uSunDisc * (smoothstep(0.9992, 0.9996, sd) + 0.25 * pow(max(sd, 0.0), 220.0));
+
+  float md = dot(rd, uMoonDir);
+  c += vec3(0.85, 0.9, 1.0) * 1.4 * smoothstep(0.9993, 0.9996, md) * smoothstep(-0.05, 0.1, uMoonDir.y) * (0.35 + 0.65 * uNight);
+
+  if (uNight > 0.01 && rd.y > -0.05) {
+    vec3 r = vec3(uSkyRot.x * rd.x - uSkyRot.y * rd.y, uSkyRot.y * rd.x + uSkyRot.x * rd.y, rd.z);
+    vec3 cell = floor(r * 160.0);
+    float star = step(0.9975, hash13(cell));
+    float tw = 0.65 + 0.35 * hash13(cell + floor(uTime * 1.5));
+    c += star * tw * 0.8 * uNight * smoothstep(-0.05, 0.1, rd.y);
+  }
+  return c;
+}
+
+vec3 applyFog(vec3 c, float t) {
+  return mix(uHorizon * 0.55 * gSky, c, exp(-t * uInvScale * 0.03));   // indoors gSky = 0: fades to black as before
 }
 
 float lavaNoise(vec3 p) {
@@ -230,6 +263,17 @@ vec3 lightSurface(vec3 p, vec3 n, vec3 alb, float ao) {
   vec3  lit = alb * vec3(0.6, 0.7, 1.0) * uAmbient * ao;
 
   vec3 sp = p + n * 0.3;                                    // shadow ray origin
+
+  // open sky: ambient from above (only where the sky can be seen) + one sun / moon shadow ray
+  vec3 sj = vec3(hash13(vec3(gl_FragCoord.xy, 41.0)), hash13(vec3(gl_FragCoord.xy, 43.0)), hash13(vec3(gl_FragCoord.xy, 47.0))) - 0.5;
+  float vis = occluded(sp, safeDir(vec3(0.0, 0.9, 0.0) + n * 0.5 + sj * 0.8), 700.0) ? 0.0 : 1.0;
+  gSky = vis;
+  lit += alb * uSkyAmb * vis * (0.55 + 0.45 * n.y) * mix(1.0, ao, 0.7);
+  float sn = max(dot(n, uCelLightDir), 0.0);
+  if (sn > 0.0 && max(uCelLightCol.r, max(uCelLightCol.g, uCelLightCol.b)) > 0.004 &&
+      !occluded(sp, safeDir(uCelLightDir + sj * 0.05), 900.0)) {
+    lit += alb * uCelLightCol * sn * mix(1.0, ao, 0.6);
+  }
   for (int i = 0; i < 8; i++) {
     if (i >= uLightCount) break;
 
@@ -436,18 +480,18 @@ void main() {
   vec3 ro = uCamPos;
   vec3 rd = safeDir(uCamFwd + (uCamRight * uv.x + uCamUp * uv.y) * uTanHalf);
 
+  gSky = 0.0;
   Hit h = trace(ro, rd, MAX_COARSE, 1e5);
   vec3 col;
   if (h.hit) {
-    col = shade(h, ro, rd);
-    col *= exp(-h.t * uInvScale * 0.03);
+    col = applyFog(shade(h, ro, rd), h.t);
   } else {
     col = sky(rd);
   }
 
   float pt; vec3 pn; int pi;
   if (traceParticles(ro, rd, h.hit ? h.t : 1e9, pt, pn, pi)) {
-    col = shadeParticle(pi, ro, rd, pt, pn) * exp(-pt * uInvScale * 0.03);
+    col = applyFog(shadeParticle(pi, ro, rd, pt, pn), pt);
   }
 
   // viewmodel on top
