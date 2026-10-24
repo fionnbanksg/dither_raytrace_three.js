@@ -241,13 +241,18 @@ export class LavaSim {
       for (let cy = Math.max(0, b - 1); cy <= Math.min(this.gy - 1, e + 1); cy++)
         for (let cx = Math.max(0, a - 1); cx <= Math.min(this.gx - 1, d + 1); cx++) {
           const i = this.idx(cx, cy, cz);
+          const hadLava = this.vol[i] > 0;
           this.solid[i] = this.cellSolid(cx, cy, cz);
-          if (this.vol[i] > 0 && (this.solid[i] || (this.fl[i] && data[this.voxBase(cx, cy, cz)] !== LAVA_ID))) {
+          if (hadLava && (this.solid[i] || (this.fl[i] && data[this.voxBase(cx, cy, cz)] !== LAVA_ID))) {
             this.vol[i] = 0;                                   // carved away (or buried in rubble)
             if (this.fl[i]) { this.fl[i] = 0; this.all.delete(i); }
           }
           for (let k = 0; k < 3; k++) { this.F[k * this.n + i] = 0; }
-          this.wakeAround(i);
+          // Only wake around cells that held lava. A cell with no lava has nothing to simulate, and any lava next to
+          // it is inside this loop too (the box is padded by one cell) so it wakes itself and the cells around it.
+          // Waking every cell in the blast box cost ~7 Set.add per cell (hundreds of thousands) and left the solver
+          // a huge awake set to chew through on the next steps.
+          if (hadLava) this.wakeAround(i);
         }
   }
 

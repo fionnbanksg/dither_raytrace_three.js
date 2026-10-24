@@ -262,7 +262,7 @@ export function generateLayout(seed = 1337, W = MAP_W, H = MAP_H) {
 }
 
 // ---------------------------------------------------------------- noise
-function hash3(x, y, z, s) {
+export function hash3(x, y, z, s) {
   let h = Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263) ^ Math.imul(z | 0, 1274126177) ^ Math.imul(s | 0, 2246822519);
   h = Math.imul(h ^ (h >>> 13), 1274126177);
   h ^= h >>> 16;

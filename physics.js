@@ -274,7 +274,6 @@ export async function createPhysics(world) {
 
   const grid = buildCellGrid(world);
   initRamps(world, grid);
-  const body = pw.createRigidBody(RAPIER.RigidBodyDesc.fixed());
   const chunksX = Math.ceil(grid.nx / CHUNK_CELLS), chunksZ = Math.ceil(grid.nz / CHUNK_CELLS);
   const chunks = new Map();                                 // key -> { collider, tris }
 
@@ -283,7 +282,7 @@ export async function createPhysics(world) {
   function rebuildChunk(kx, kz) {
     const key = kx + chunksX * kz;
     const old = chunks.get(key);
-    if (old) { pw.removeCollider(old.collider, false); physics.triangles -= old.tris; chunks.delete(key); }
+    if (old) { pw.removeRigidBody(old.body); physics.triangles -= old.tris; chunks.delete(key); }   // removes its collider too
     const region = {
       lo: [kx * CHUNK_CELLS, 0, kz * CHUNK_CELLS],
       hi: [Math.min(grid.nx, (kx + 1) * CHUNK_CELLS), grid.ny, Math.min(grid.nz, (kz + 1) * CHUNK_CELLS)],
@@ -292,15 +291,24 @@ export async function createPhysics(world) {
     if (mesh.indices.length === 0) return;
     const desc = RAPIER.ColliderDesc.trimesh(mesh.vertices, mesh.indices, RAPIER.TriMeshFlags.FIX_INTERNAL_EDGES);
     const tris = mesh.indices.length / 3;
-    chunks.set(key, { collider: pw.createCollider(desc, body), tris });
+    // One fixed body PER CHUNK, not one shared by all of them. Swapping a collider on a body marks that whole body
+    // dirty, and with all ~480 chunk colliders on a single body the next step() re-processed every one of them (~20 ms
+    // after every blast, however small). On its own body only this chunk is touched.
+    const body = pw.createRigidBody(RAPIER.RigidBodyDesc.fixed());
+    chunks.set(key, { body, collider: pw.createCollider(desc, body), tris });
     physics.triangles += tris;
   }
 
   for (let kz = 0; kz < chunksZ; kz++) for (let kx = 0; kx < chunksX; kx++) rebuildChunk(kx, kz);
 
   // Call after editing world.data inside a voxel box ({x0,y0,z0,x1,y1,z1}, end-exclusive).
-  // Re-votes the affected cells and rebuilds only the chunks whose surface changed.
-  physics.updateRegion = (box) => {
+  // Re-votes the affected cells (cheap) and works out which chunks' surface changed. By default those chunks are
+  // rebuilt right away; with { defer: true } they are only queued, and physics.flushPending() rebuilds them one or
+  // a few per call. Building a Rapier trimesh (BVH + FIX_INTERNAL_EDGES) is the expensive part of a blast, and doing 6-16
+  // of them in one frame was most of the hitch. Until a queued chunk is rebuilt its old collider stays in place
+  // (rebuildChunk swaps old for new in one call), so the world is never left with a hole.
+  const pending = new Map();                                // chunk key -> { kx, kz }, de-duplicated across blasts
+  physics.updateRegion = (box, { defer = false } = {}) => {
     const ch = refreshCells(world, grid, box);
     // ramp heights look at the surface around the box, so refresh two cells further out
     const rx0 = Math.floor(box.x0 / CELL_VOX) - 2, rx1 = Math.floor((box.x1 - 1) / CELL_VOX) + 2;
@@ -312,10 +320,38 @@ export async function createPhysics(world) {
     const kx0 = Math.max(0, Math.floor((g.x0 - 1) / CHUNK_CELLS)), kx1 = Math.min(chunksX - 1, Math.floor((g.x1 + 1) / CHUNK_CELLS));
     const kz0 = Math.max(0, Math.floor((g.z0 - 1) / CHUNK_CELLS)), kz1 = Math.min(chunksZ - 1, Math.floor((g.z1 + 1) / CHUNK_CELLS));
     let n = 0;
-    for (let kz = kz0; kz <= kz1; kz++) for (let kx = kx0; kx <= kx1; kx++) { rebuildChunk(kx, kz); n++; }
-    pw.step();   // refresh the query pipeline so the character controller sees the new colliders
+    for (let kz = kz0; kz <= kz1; kz++) for (let kx = kx0; kx <= kx1; kx++) {
+      n++;
+      if (defer) pending.set(kx + chunksX * kz, { kx, kz });
+      else { pending.delete(kx + chunksX * kz); rebuildChunk(kx, kz); }
+    }
+    if (!defer) pw.step();   // refresh the query pipeline so the character controller sees the new colliders
     return n;
   };
+
+  // Rebuild queued chunks until `budgetMs` has been spent (always at least one, so the queue always drains).
+  // A chunk is ~3 ms (mesh + collider + step), so a blast's 6-16 chunks spread over a few frames instead of landing in one.
+  // focus = [x, z] in voxels (the player): the chunks nearest to it go first, since those are the ones that matter.
+  // Returns how many chunks are still waiting.
+  physics.flushPending = (budgetMs = 3, focus = null) => {
+    if (pending.size === 0) return 0;
+    const t0 = performance.now();
+    const cv = CHUNK_CELLS * CELL_VOX;                       // chunk edge in voxels
+    let n = 0;
+    while (pending.size > 0 && (n === 0 || performance.now() - t0 < budgetMs)) {
+      let bestKey = -1, best = null, bestD = Infinity;
+      for (const [key, c] of pending) {
+        const d = focus ? Math.hypot((c.kx + 0.5) * cv - focus[0], (c.kz + 0.5) * cv - focus[1]) : key;
+        if (d < bestD) { bestD = d; bestKey = key; best = c; }
+      }
+      pending.delete(bestKey);
+      rebuildChunk(best.kx, best.kz);
+      n++;
+    }
+    pw.step();   // refresh the query pipeline so the character controller sees the new colliders
+    return pending.size;
+  };
+  Object.defineProperty(physics, 'pendingChunks', { get: () => pending.size });
 
   pw.step();   // build the query pipeline
   return physics;

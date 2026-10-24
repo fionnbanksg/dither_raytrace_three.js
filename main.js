@@ -262,7 +262,7 @@ addEventListener('keydown', (e) => {
 // ---------------------------------------------------------------- explosions
 // 1. explode() edits world.data (voxels + coarse grid) on the CPU
 // 2. the changed box is pushed to the GPU texture with texSubImage3D (not the whole 80 MB volume)
-// 3. physics.updateRegion() re-meshes only the collision chunks that changed
+// 3. physics.updateRegion() works out which collision chunks changed; flushPending() re-meshes them a few ms per frame
 function uploadBox(tex, data, size, box) {
   const glTex = renderer.properties.get(tex).__webglTexture;
   if (!glTex) { tex.needsUpdate = true; return; }              // not on the GPU yet: the normal full upload covers it
@@ -299,14 +299,15 @@ function detonate(point, normal, radiusM) {
   if (box) {
     uploadVoxelBox(box);
     coarseTex.needsUpdate = true;                             // 157 KB, cheap to re-upload whole
-    physics.updateRegion(box);
+    physics.updateRegion(box, { defer: true });               // collision chunks are rebuilt a few ms per frame (physics.flushPending in frame())
     minimap?.refresh(box);                                    // craters show up on the map
-    stats.lastBlast = { dims: `${box.x1 - box.x0}x${box.y1 - box.y0}x${box.z1 - box.z0}`, ms: performance.now() - t0 };
 
     // braziers whose flame voxel was destroyed go out
     staticLights.forEach((l) => { if (!l.dead && voxelAt(world, ...l.anchor) !== 6) l.dead = true; });
     lava.notifyCarved(box);                                   // blasts can carve lava away / open new paths for it
     lavaGlow.carved(box);                                     // ...and open or close paths for its light
+    // time spent inside this click's frame (the collision rebuild is no longer part of it)
+    stats.lastBlast = { dims: `${box.x1 - box.x0}x${box.y1 - box.y0}x${box.z1 - box.z0}`, ms: performance.now() - t0 };
   }
 
   stats.blasts++;
@@ -448,6 +449,8 @@ function frame(now) {
     gunMuzzle = Math.max(gunMuzzle, 0.55);                     // keep the muzzle glowing while it sprays
     gunKick = Math.max(gunKick, 0.12);
   } else if (fire && gunCooldown <= 0 && input.locked) shoot(fire === 2 ? SHOTS.big : SHOTS.small);
+
+  physics.flushPending(3, [mToVoxX(player.x), mToVoxZ(player.z)]);   // finish queued collision rebuilds, ~3 ms per frame (nearest the player first)
 
   player.alpha = acc / FIXED_DT;
   player.frameUpdate(dt);

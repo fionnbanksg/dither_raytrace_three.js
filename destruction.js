@@ -5,7 +5,7 @@
 // server. Everything here works in *voxel* units. The caller is responsible for pushing the
 // returned box to the GPU (main.js) and to the collision world (physics.updateRegion).
 
-import { T, BRICK, vnoise } from './world.js';
+import { T, BRICK, vnoise, hash3 } from './world.js';
 
 const S = T / 16;
 const SCORCH_ID = 7;
@@ -59,7 +59,39 @@ export function refreshCoarse(world, box) {
   }
 }
 
+// vnoise(x * f, y * f, z * f, s) for integer x, y, z inside a known box, with the lattice hashes computed once up front.
+// Neighbouring voxels share the same 8 lattice corners (a lattice cell is 1/f voxels across), so the plain vnoise()
+// re-hashed the same corners hundreds of times per blast. The interpolation below is vnoise's, operation for operation,
+// so the result is bit-identical.
+function latticeNoise(f, s, x0, x1, y0, y1, z0, z1) {
+  const ax = Math.floor(x0 * f), ay = Math.floor(y0 * f), az = Math.floor(z0 * f);
+  const nx = Math.floor((x1 - 1) * f) + 2 - ax + 1, ny = Math.floor((y1 - 1) * f) + 2 - ay + 1, nz = Math.floor((z1 - 1) * f) + 2 - az + 1;
+  const L = new Float64Array(nx * ny * nz);
+  for (let k = 0, i = 0; k < nz; k++) for (let j = 0; j < ny; j++) for (let m = 0; m < nx; m++, i++) L[i] = hash3(ax + m, ay + j, az + k, s);
+  const sxy = nx * ny;
+  return (x, y, z) => {
+    const X = x * f, Y = y * f, Z = z * f;
+    const xi = Math.floor(X), yi = Math.floor(Y), zi = Math.floor(Z);
+    const fx = X - xi, fy = Y - yi, fz = Z - zi;
+    const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy), w = fz * fz * (3 - 2 * fz);
+    const b = (xi - ax) + nx * (yi - ay) + sxy * (zi - az);
+    const c000 = L[b], c100 = L[b + 1], c010 = L[b + nx], c110 = L[b + nx + 1];
+    const c001 = L[b + sxy], c101 = L[b + sxy + 1], c011 = L[b + sxy + nx], c111 = L[b + sxy + nx + 1];
+    const a0 = (c000 + (c100 - c000) * u), a1 = (c010 + (c110 - c010) * u), a2 = (c001 + (c101 - c001) * u), a3 = (c011 + (c111 - c011) * u);
+    const b0 = a0 + (a1 - a0) * v, b1 = a2 + (a3 - a2) * v;
+    return b0 + (b1 - b0) * w;
+  };
+}
+
 // ---------------------------------------------------------------- explosion
+// x range [a, b) of one grid row that can lie inside a sphere, given rem = r^2 - dy^2 - dz^2 for that row.
+// Padded by one voxel each side: callers still do the exact distance test, this only skips the empty corners of the box.
+function rowSpan(cx, rem, x0, x1) {
+  if (rem < 0) return [0, 0];
+  const h = Math.sqrt(rem);
+  return [Math.max(x0, Math.floor(cx - 0.5 - h) - 1), Math.min(x1, Math.ceil(cx - 0.5 + h) + 2)];
+}
+
 // center: [x, y, z] voxels.  radius: voxels (16 voxels = 1 m at T = 64).
 // opts.keepClear: [{ x, y, z, r }] voxel-space spheres that never receive rubble (put the player here
 //                 so a new collision cell can't form inside the capsule).
@@ -86,13 +118,17 @@ export function explode(world, center, radius, opts = {}) {
   const nf = 0.11;                      // noise frequency (voxels): lumps ~9 voxels across
 
   // radius field: shared by carve and scorch so the soot hugs the crater wall
-  const craterR = (x, y, z) => R * (0.8 + 0.4 * vnoise(x * nf, y * nf, z * nf, seed));
+  const craterNoise = latticeNoise(nf, seed, x0, x1, y0, y1, z0, z1);
+  const craterR = (x, y, z) => R * (0.8 + 0.4 * craterNoise(x, y, z));
 
   // 1. carve ------------------------------------------------------------------
   let carved = 0;
   const r2max = rMax * rMax, rIn2 = (R * 0.8) * (R * 0.8);
-  for (let z = z0; z < z1; z++) for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
-    const dx = x + 0.5 - cx, dy = y + 0.5 - cy, dz = z + 0.5 - cz;
+  for (let z = z0; z < z1; z++) for (let y = y0; y < y1; y++) {
+    const dy = y + 0.5 - cy, dz = z + 0.5 - cz;
+    const [xa, xb] = rowSpan(cx, r2max - dy * dy - dz * dz, x0, x1);   // only the part of the row inside the sphere
+    for (let x = xa; x < xb; x++) {
+    const dx = x + 0.5 - cx;
     const d2 = dx * dx + dy * dy + dz * dz;
     if (d2 > r2max) continue;
     const i = idx(x, y, z);
@@ -105,6 +141,7 @@ export function explode(world, center, radius, opts = {}) {
     data[i] = 0; carved++;
     // sample a few removed voxels so the caller can spawn debris of the right material
     if (debrisOut && debrisOut.length < debrisMax && Math.random() < debrisChance) debrisOut.push({ x: x + 0.5, y: y + 0.5, z: z + 0.5, id });
+    }
   }
   if (carved === 0) return null;
 
@@ -115,17 +152,21 @@ export function explode(world, center, radius, opts = {}) {
     (x > 0 && data[idx(x - 1, y, z)] === 0) || (x < sx - 1 && data[idx(x + 1, y, z)] === 0) ||
     (y > 0 && data[idx(x, y - 1, z)] === 0) || (y < sy - 1 && data[idx(x, y + 1, z)] === 0) ||
     (z > 0 && data[idx(x, y, z - 1)] === 0) || (z < sz - 1 && data[idx(x, y, z + 1)] === 0);
-  for (let z = z0; z < z1; z++) for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+  for (let z = z0; z < z1; z++) for (let y = y0; y < y1; y++) {
+    const dy = y + 0.5 - cy, dz = z + 0.5 - cz;
+    const [xa, xb] = rowSpan(cx, reach2 - dy * dy - dz * dz, x0, x1);
+    for (let x = xa; x < xb; x++) {
     const i = idx(x, y, z);
     const id = data[i];
     if (id === 0 || id > 5) continue;                      // air, flame, soot: leave alone
-    const dx = x + 0.5 - cx, dy = y + 0.5 - cy, dz = z + 0.5 - cz;
+    const dx = x + 0.5 - cx;
     const d2 = dx * dx + dy * dy + dz * dz;
     if (d2 > reach2 || !exposed(x, y, z)) continue;        // cheap tests first, noise last
     // 1 at the crater wall, fading to 0 at scorchW beyond it; noise breaks the edge up
     const k = 1 - (Math.sqrt(d2) - craterR(x, y, z)) / scorchW;
     if (k <= 0) continue;
     if (k > 0.25 + 0.75 * vnoise(x * 0.31, y * 0.31, z * 0.31, seed + 3)) data[i] = SCORCH_ID;
+    }
   }
 
   // 3. rubble: loose stone on the floor around the crater --------------------
