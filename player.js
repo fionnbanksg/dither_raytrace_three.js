@@ -171,7 +171,8 @@ export class Player {
     const sy = Math.sin(this.yaw), cy = Math.cos(this.yaw);
     const fx = sy * cp, fy = sp, fz = -cy * cp, rx = cy, rz = sy;
     const sp2 = o.flySpeed * (intent.sprint ? o.flyFastMul : 1);
-    const vert = (intent.jumpHeld ? 1 : 0) - (intent.down ? 1 : 0);
+    const vert = (intent.jumpHeld 
+      ? 1 : 0) - (intent.down ? 1 : 0);
     const tx = (fx * intent.forward + rx * intent.strafe) * sp2;
     const ty = (fy * intent.forward + vert) * sp2;
     const tz = (fz * intent.forward + rz * intent.strafe) * sp2;
