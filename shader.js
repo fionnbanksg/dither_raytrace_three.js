@@ -26,7 +26,7 @@ uniform float uEmissive;    // brightness of emissive voxels (id == 6)
 uniform float uDither;      // dither strength: 0 = banding, 1 = full Bayer
 uniform float uInvScale;    // 4 / voxelsPerTile: converts voxel distances to the old unit scale
 uniform float uBlock;       // size (voxels) of the blocky colour-variation cells
-uniform vec3  uPalette[10];
+uniform vec3  uPalette[12];
 uniform vec3  uLightPos[8];
 uniform vec3  uLightCol[8]; // colour * intensity
 uniform int   uLightCount;

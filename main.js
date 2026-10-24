@@ -96,7 +96,7 @@ const skyClock = new SkyClock(num('time', 0.3), num('day', 240));
 const v3 = (a) => new THREE.Vector3(...a);
 const skyU = skyState(skyClock.tod);
 
-const palette = Array.from({ length: 10 }, (_, i) => new THREE.Vector3(...(PALETTE[i] ?? [1, 0, 1])));
+const palette = Array.from({ length: 12 }, (_, i) => new THREE.Vector3(...(PALETTE[i] ?? [1, 0, 1])));
 
 // Lights: index 0 is the player's torch (follows the camera), the rest come from the world.
 const MAX_LIGHTS = 8;
@@ -197,7 +197,7 @@ warmUpGlow();   // same for the lava glow solver
 
 // world.spawns are spread across the map (farthest-point sampling). Multiplayer: the server assigns the index.
 const spawnPoint = world.spawns[(parseInt(params.get('spawn'), 10) || 0) % world.spawns.length];
-const spawn = { x: (spawnPoint.tx + 0.5) * TILE_M, y: 0, z: (spawnPoint.tz + 0.5) * TILE_M };
+const spawn = { x: (spawnPoint.tx + 0.5) * TILE_M, y: spawnPoint.ym ?? 0, z: (spawnPoint.tz + 0.5) * TILE_M };
 const player = new Player(physics, spawn);    // tweak the feel: new Player(physics, spawn, { walkSpeed: 5, jumpHeight: 1.3 })
 const input = new Input(canvas, { yaw: spawnPoint.yaw });   // spawn facing along the longest open run
 
@@ -214,7 +214,7 @@ if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Spac
 const stats = { shots: 0, blasts: 0, lastBlast: null };   // counters updated by shoot() / detonate()
 const GL_DEBUG = gl.getExtension('WEBGL_debug_renderer_info');
 const gpuName = GL_DEBUG ? gl.getParameter(GL_DEBUG.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
-const MATERIALS = ['air', 'stone', 'grass', 'dungeon floor', 'wood', 'brick', 'flame', 'scorched stone', 'lava'];
+const MATERIALS = ['air', 'stone', 'grass', 'dungeon floor', 'wood', 'brick', 'flame', 'scorched stone', 'lava', 'leaves', 'boulder'];
 const COMPASS = ['N (-Z)', 'NE', 'E (+X)', 'SE', 'S (+Z)', 'SW', 'W (-X)', 'NW'];
 const debugEl = document.getElementById('debug');
 const debug = debugEl && new DebugOverlay(debugEl, () => {

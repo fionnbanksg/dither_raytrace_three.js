@@ -23,14 +23,19 @@ export const PALETTE = [
   [1.00, 0.60, 0.20], // 6 emissive flame
   [0.13, 0.115, 0.105], // 7 scorched stone (explosion soot)
   [1.00, 0.34, 0.06], // 8 lava (emissive, animated in shader.js; simulated in lava.js)
+  [0.16, 0.36, 0.08], // 9 leaves
+  [0.40, 0.39, 0.37], // 10 boulder rock
 ];
 
 // ---------------------------------------------------------------- procedural layout
 // Tile legend:  '#' wall   '.' floor   'g' grass floor   'o' open-air grass (no roof, sky above)   'B' timber doorway   'L' brazier
+//               'x' outdoor terrain (the margin around the dungeon)   'C' cave-mouth tile (solid rock the tunnel is cut through)
 //
 // The layout is a pure function of the seed, so every multiplayer client that is given the same
 // seed builds exactly the same level (the server only has to send one integer).
-export const MAP_W = 18, MAP_H = 14;     // tiles; world memory grows with MAP_W * MAP_H * T^2 * WORLD_H
+export const MAP_W = 16, MAP_H = 12;     // dungeon size in tiles (the hills sit on top of it)
+export const MARGIN = 4;                 // tiles of outdoor terrain around the dungeon. World = (MAP_W+2*MARGIN) x (MAP_H+2*MARGIN) tiles;
+                                         // memory grows with that area * T^2 * WORLD_H (24x20 tiles ~ 173MB)
 const MAX_BRAZIERS = 4;                  // light slots are shared with the torch and explosion flashes
 const SPAWN_COUNT = 8;
 
@@ -38,10 +43,11 @@ export let MAP = [];                     // set by buildWorld(); rows of tile ch
 
 export function isWalkable(tx, tz) {
   const row = MAP[tz];
-  return !!row && row[tx] !== undefined && row[tx] !== '#' && row[tx] !== 'L';
+  return !!row && row[tx] !== undefined && row[tx] !== '#' && row[tx] !== 'L' && row[tx] !== 'C';
 }
-export const isOutdoor = (tx, tz) => !!MAP[tz] && MAP[tz][tx] === 'o';
-const openTile = (tx, tz) => !!MAP[tz] && MAP[tz][tx] !== undefined && MAP[tz][tx] !== '#';
+export const isOutdoor = (tx, tz) => !!MAP[tz] && (MAP[tz][tx] === 'o' || MAP[tz][tx] === 'x');
+// open = carved by the dungeon pass. Margin ('x') and cave-mouth ('C') tiles are shaped by the terrain pass instead.
+const openTile = (tx, tz) => !!MAP[tz] && MAP[tz][tx] !== undefined && MAP[tz][tx] !== '#' && MAP[tz][tx] !== 'x' && MAP[tz][tx] !== 'C';
 
 function mulberry32(a) {
   return () => {
@@ -281,8 +287,36 @@ const clamp01 = (v) => Math.min(1, Math.max(0, v));
 // ---------------------------------------------------------------- world
 export function buildWorld(seed = 1337) {
   const layout = generateLayout(seed);
-  MAP = layout.map;
+  const inner = layout.map, IW = inner[0].length, IH = inner.length, M = MARGIN;
+
+  // cave mouths: one per side where a plain floor tile touches the outer wall ring (own rng: layout is unchanged)
+  const crng = mulberry32((seed ^ 0xCA7E5) >>> 0);
+  const entrances = [];
+  const sides = [
+    { dir: 'W', cells: () => { const c = []; for (let z = 2; z < IH - 2; z++) c.push([1, z]); return c; } },
+    { dir: 'E', cells: () => { const c = []; for (let z = 2; z < IH - 2; z++) c.push([IW - 2, z]); return c; } },
+    { dir: 'N', cells: () => { const c = []; for (let x = 2; x < IW - 2; x++) c.push([x, 1]); return c; } },
+    { dir: 'S', cells: () => { const c = []; for (let x = 2; x < IW - 2; x++) c.push([x, IH - 2]); return c; } },
+  ];
+  for (const sd of sides) {
+    const cand = sd.cells().filter(([x, z]) => inner[z][x] === '.' || inner[z][x] === 'g');
+    if (!cand.length) continue;
+    const [x, z] = cand[Math.floor(crng() * cand.length)];
+    entrances.push({ dir: sd.dir, tx: x + M, tz: z + M });
+  }
+
+  // pad the dungeon with outdoor margin tiles
+  const grid = Array.from({ length: IH + 2 * M }, (_, z) => Array.from({ length: IW + 2 * M }, (_, x) => {
+    const ix = x - M, iz = z - M;
+    return ix >= 0 && iz >= 0 && ix < IW && iz < IH ? inner[iz][ix] : 'x';
+  }));
+  for (const e of entrances) {
+    if (e.dir === 'W') grid[e.tz][M] = 'C'; else if (e.dir === 'E') grid[e.tz][M + IW - 1] = 'C';
+    else if (e.dir === 'N') grid[M][e.tx] = 'C'; else grid[M + IH - 1][e.tx] = 'C';
+  }
+  MAP = grid.map((r) => r.join(''));
   const MW = MAP[0].length, MH = MAP.length;
+  const spawns = layout.spawns.map((sp) => ({ ...sp, tx: sp.tx + M, tz: sp.tz + M }));
   const sx = MW * T, sy = WORLD_H, sz = MH * T, layer = sx * sy;
   const idx = (x, y, z) => x + sx * y + layer * z;     // x fastest, matches Data3DTexture
   const data = new Uint8Array(sx * sy * sz).fill(1);   // start as solid stone
@@ -290,7 +324,7 @@ export function buildWorld(seed = 1337) {
   // 1. carve the tiles
   for (let tz = 0; tz < MH; tz++) for (let tx = 0; tx < MW; tx++) {
     const ch = MAP[tz][tx];
-    if (ch === '#') continue;
+    if (ch === '#' || ch === 'x' || ch === 'C') continue;   // solid / terrain tiles are shaped by the terrain pass
     for (let lz = 0; lz < T; lz++) for (let lx = 0; lx < T; lx++) {
       const b = idx(tx * T + lx, 0, tz * T + lz);
       data[b] = 3;                                      // floor
@@ -403,6 +437,209 @@ export function buildWorld(seed = 1337) {
                   anchor: [x0 + c, 4 * S, z0 + c] });   // a flame voxel: if it's destroyed the light goes out
   }
 
+  // 5b. outdoor terrain. The dungeon block becomes a hill; the margin is low ground with a ridge round the world
+  //     edge. Tunnel mouths are cut through the hillside as arches. Then trees, boulders, logs and bushes go on top.
+  const SMOOTH = (a, b, x) => { const t = clamp01((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+  const RX0 = M * T, RX1 = (M + IW) * T, RZ0 = M * T, RZ1 = (M + IH) * T;      // dungeon rectangle, in voxels
+  const HILL_MIN = 17.25 * S, HILL_VAR = 3 * S;   // hill top height (must clear the highest ceiling erosion)
+  const G0 = 0.75 * S, G_VAR = 2.5 * S;           // valley floor height
+  const FALL = 1.75 * T;                          // horizontal run of the hillside
+  const HW = 5.5 * S;                             // half width of a cave mouth
+  const ARCH = OPEN_H - 3;                        // arch height
+  const TF = 0.044 / S;                           // terrain noise frequency
+  const GR = 4, gw = Math.ceil(sx / GR) + 2, gh = Math.ceil(sz / GR) + 2;
+  const tabA = new Float32Array(gw * gh), tabB = new Float32Array(gw * gh), tabC = new Float32Array(gw * gh);
+  for (let j = 0; j < gh; j++) for (let i = 0; i < gw; i++) {   // noise on a coarse grid, interpolated per column
+    const x = i * GR, z = j * GR;
+    tabA[i + gw * j] = fbm(x * TF, 0, z * TF, seed + 101);
+    tabB[i + gw * j] = fbm(x * TF * 1.7 + 50, 0, z * TF * 1.7, seed + 131);
+    tabC[i + gw * j] = vnoise(x * TF * 3, 9, z * TF * 3, seed + 151);
+  }
+  const samp = (tab, x, z) => {
+    const gx = x / GR, gz = z / GR, i = Math.floor(gx), j = Math.floor(gz), fx = gx - i, fz = gz - j;
+    const a = tab[i + gw * j], b = tab[i + 1 + gw * j], c = tab[i + gw * (j + 1)], d = tab[i + 1 + gw * (j + 1)];
+    return (a + (b - a) * fx) * (1 - fz) + (c + (d - c) * fx) * fz;
+  };
+  // t = distance outside the dungeon rectangle along the mouth, u = sideways offset from its centre line
+  const mouthTU = (e, x, z) => {
+    const cx = (e.tx + 0.5) * T, cz = (e.tz + 0.5) * T;
+    if (e.dir === 'W') return [RX0 - x, z - cz];
+    if (e.dir === 'E') return [x - RX1, z - cz];
+    if (e.dir === 'N') return [RZ0 - z, x - cx];
+    return [z - RZ1, x - cx];
+  };
+  const inMouthZone = (x, z, pad) => entrances.some((e) => { const [t, u] = mouthTU(e, x, z); return t > -(T + 4) && t < 190 + pad && Math.abs(u) < HW + 30 + pad; });
+
+  const hTop = new Int16Array(sx * sz);    // top solid voxel of each column (before carving)
+  const mFloor = new Int16Array(sx * sz).fill(-1);   // >= 0: column is part of a cave mouth, floor height
+  const mArch = new Int16Array(sx * sz);
+  const mT = new Int16Array(sx * sz);
+  for (let z = 0; z < sz; z++) for (let x = 0; x < sx; x++) {
+    const A = samp(tabA, x, z), B = samp(tabB, x, z);
+    const hillTop = HILL_MIN + HILL_VAR * clamp01((A - 0.2) / 0.6);
+    const ground = G0 + G_VAR * clamp01((B - 0.2) / 0.6);
+    const d = Math.hypot(Math.max(RX0 - x, 0, x - (RX1 - 1)), Math.max(RZ0 - z, 0, z - (RZ1 - 1)));
+    let f = 1, arch = 0, mt = 0;
+    for (const e of entrances) {
+      const [t, u] = mouthTU(e, x, z), lat = Math.abs(u);
+      if (t < -(T + 4) || t > 170 || lat > HW + 30) continue;
+      const lon = t <= 0 ? 0 : SMOOTH(0, 100, t);
+      f = Math.min(f, Math.max(SMOOTH(HW * 0.7, HW + 26, lat), lon));    // ground ramps up from the tunnel floor
+      if (lat < HW && t < 150) { arch = Math.max(arch, Math.round(ARCH * Math.sqrt(1 - (lat / HW) ** 2))); mt = t; }
+    }
+    const w = clamp01(d / FALL), sh = 0.5 * SMOOTH(0, 1, w) + 0.5 * w;
+    let H = ground * f * sh + hillTop * (1 - sh);
+    const edge = Math.min(x, sx - 1 - x, z, sz - 1 - z);
+    H += (sy - 3 - H) * (1 - SMOOTH(8, 70, edge));                          // ridge round the edge keeps players in
+    const i = x + sx * z;
+    hTop[i] = Math.min(sy - 3, Math.floor(H));
+    if (arch > 0) { mFloor[i] = Math.floor(ground * f); mArch[i] = arch; mT[i] = mt; }
+  }
+
+  // clear everything above the terrain surface (z, y, x order so the writes are sequential)
+  for (let z = 0; z < sz; z++) for (let y = 1; y < sy; y++) {
+    const row = sx * (y + sy * z);
+    for (let x = 0; x < sx; x++) if (y > hTop[x + sx * z]) data[row + x] = 0;
+  }
+  // cut the cave mouths: arch-shaped, floor follows the ramp
+  const surf = Int16Array.from(hTop);
+  for (let z = 0; z < sz; z++) for (let x = 0; x < sx; x++) {
+    const i = x + sx * z, a = mArch[i];
+    if (!a) continue;
+    const fl = mFloor[i];
+    for (let y = fl + 1; y <= Math.min(a, hTop[i]); y++) data[idx(x, y, z)] = 0;
+    if (hTop[i] > fl) surf[i] = fl;
+    if (fl === 0) data[idx(x, 0, z)] = mT[i] < 30 ? 3 : 2;
+  }
+  // surface material + grass tufts: grass on gentle ground, bare rock on steep slopes and a few outcrops
+  for (let z = 1; z < sz - 1; z++) for (let x = 1; x < sx - 1; x++) {
+    const i = x + sx * z, y0 = surf[i];
+    if (y0 < 0 || data[idx(x, y0, z)] === 0) continue;                       // open-air pits have no terrain surface
+    if (mArch[i] && mT[i] < 30) continue;                                   // keep the tunnel floor
+    const sl = Math.max(Math.abs(surf[i + 2] - surf[i - 2]), Math.abs(surf[i + 2 * sx] - surf[i - 2 * sx])) / 4;
+    const rocky = sl > 0.9 || samp(tabC, x, z) > 0.8;
+    const m = rocky ? 1 : 2;
+    data[idx(x, y0, z)] = m;
+    if (y0 > 0) data[idx(x, y0 - 1, z)] = m;
+    if (rocky || y0 + 9 >= sy) continue;
+    const r = hash3(Math.floor(x / S), 0, Math.floor(z / S), seed + 19);
+    const base = r > 0.95 ? 2 : r > 0.78 ? 1 : 0;
+    const h = Math.round(base * S * (0.6 + 0.4 * hash3(x, 1, z, seed + 23)));
+    for (let y = y0 + 1; y <= y0 + h; y++) if (data[idx(x, y, z)] === 0) data[idx(x, y, z)] = 2;
+  }
+
+  // 5c. props: trees on the low ground, boulders / logs / bushes everywhere (cover for an FPS)
+  const prng = mulberry32((seed ^ 0x7EE5A1) >>> 0);
+  const pr = () => prng();
+  const pri = (a, b) => a + Math.floor(pr() * (b - a + 1));
+  const put = (x, y, z, m, force) => {
+    if (x < 1 || z < 1 || y < 1 || x >= sx - 1 || z >= sz - 1 || y >= sy - 1) return;
+    const i = idx(x, y, z);
+    if (force || data[i] === 0) data[i] = m;
+  };
+  const ellipsoid = (cx, cy, cz, rx, ry, rz, m, rough, seedOff, topMat) => {
+    for (let z = Math.floor(cz - rz - 2); z <= cz + rz + 2; z++) for (let y = Math.floor(cy - ry - 2); y <= cy + ry + 2; y++) for (let x = Math.floor(cx - rx - 2); x <= cx + rx + 2; x++) {
+      const q = ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 + ((z - cz) / rz) ** 2;
+      if (q > 1.5) continue;
+      const lim = 1 + (vnoise(x * 0.16, y * 0.16, z * 0.16, seed + seedOff) - 0.5) * rough;
+      if (q > lim) continue;
+      put(x, y, z, topMat && y > cy + ry * 0.55 && vnoise(x * 0.2, 0, z * 0.2, seed + 61) > 0.45 ? topMat : m, false);
+    }
+  };
+  const surfAt = (x, z) => surf[Math.max(0, Math.min(sx - 1, Math.round(x))) + sx * Math.max(0, Math.min(sz - 1, Math.round(z)))];
+  const slopeAt = (x, z) => Math.max(Math.abs(surfAt(x + 5, z) - surfAt(x - 5, z)), Math.abs(surfAt(x, z + 5) - surfAt(x, z - 5))) / 10;
+  const tileCh = (x, z) => (MAP[(z / T) | 0] || '')[(x / T) | 0];
+  const nearPit = (x, z, m) => [[0, 0], [m, 0], [-m, 0], [0, m], [0, -m], [m, m], [-m, -m], [m, -m], [-m, m]].some(([dx, dz]) => tileCh(x + dx, z + dz) === 'o');
+  const objs = [];
+  const room = (x, z, r) => objs.every((o) => Math.hypot(o.x - x, o.z - z) >= o.r + r + 3);
+  const add = (x, z, r) => objs.push({ x, z, r });
+
+  const tree = (x, z) => {
+    const top = surfAt(x, z), pine = pr() < 0.4, ht = pine ? pri(46, 58) : pri(40, 48), tr = pine ? 2.6 : 3.2;
+    for (let y = top - 3; y <= top + ht; y++) {
+      const k = (y - top) / ht, flare = y < top + 5 ? 1.6 * (1 - (y - top) / 5) : 0, r = tr * (1 - 0.35 * Math.max(k, 0)) + flare;
+      for (let dz = -5; dz <= 5; dz++) for (let dx = -5; dx <= 5; dx++) if (dx * dx + dz * dz <= r * r) put(x + dx, y, z + dz, 4, true);
+    }
+    if (pine) {
+      const y0 = top + 14, span = ht - 10;
+      for (let y = y0; y <= top + ht + 4; y++) {
+        const t = (y - y0) / span, r = 15 * Math.pow(Math.max(0, 1 - t), 0.9) * ((y - top) % 6 < 3 ? 1 : 0.72) + 1;
+        for (let dz = -16; dz <= 16; dz++) for (let dx = -16; dx <= 16; dx++) {
+          if (dx * dx + dz * dz > r * r || vnoise((x + dx) * 0.35, y * 0.35, (z + dz) * 0.35, seed + 9) < 0.27) continue;
+          put(x + dx, y, z + dz, 9, false);
+        }
+      }
+    } else {
+      const cy = top + ht - 6, n = pri(3, 5);
+      for (let k = 0; k < n; k++) {
+        const a = pr() * 6.283, o = k === 0 ? 0 : 7 + pr() * 6;
+        ellipsoid(x + Math.cos(a) * o, cy + (k === 0 ? 0 : pr() * 6 - 3), z + Math.sin(a) * o, 12 + pr() * 4, 9 + pr() * 3, 12 + pr() * 4, 9, 0.9, 9);
+      }
+    }
+    add(x, z, 11);
+  };
+  const boulder = (x, z, r) => {
+    const ry = r * (0.6 + pr() * 0.25), rz = r * (0.8 + pr() * 0.35);
+    let mn = 1e9;
+    for (const [dx, dz] of [[0, 0], [r * 0.7, 0], [-r * 0.7, 0], [0, rz * 0.7], [0, -rz * 0.7]]) mn = Math.min(mn, surfAt(x + dx, z + dz));
+    ellipsoid(x, mn + ry * 0.35, z, r, ry, rz, 10, 0.7, 31, 2);
+    add(x, z, Math.max(r, rz));
+  };
+  const bush = (x, z) => {
+    const r = pri(8, 12), top = surfAt(x, z);
+    ellipsoid(x, top + r * 0.2, z, r, r * 0.65, r, 9, 0.8, 41);
+    if (pr() < 0.5) ellipsoid(x + r * 0.8, top + r * 0.1, z + r * 0.3, r * 0.7, r * 0.5, r * 0.7, 9, 0.8, 43);
+    add(x, z, r + 2);
+  };
+  const logAt = (x, z) => {
+    const alongX = pr() < 0.5, L = pri(34, 60), rr = 4 + pr() * 1.5, top = surfAt(x, z);
+    for (let l = -L / 2; l <= L / 2; l++) for (let a = -6; a <= 6; a++) for (let b = -6; b <= 6; b++) {
+      if (a * a + b * b > rr * rr) continue;
+      put(Math.round(x + (alongX ? l : a)), Math.round(top + rr * 0.55 + b), Math.round(z + (alongX ? a : l)), 4, false);
+    }
+    add(x, z, L / 2);
+  };
+
+  const CELL = 36;
+  for (let cz = 40; cz < sz - 40; cz += CELL) for (let cx = 40; cx < sx - 40; cx += CELL) {
+    const x = cx + Math.floor(pr() * CELL), z = cz + Math.floor(pr() * CELL);
+    const y0 = surfAt(x, z), edge = Math.min(x, sx - 1 - x, z, sz - 1 - z);
+    if (edge < 60 || data[idx(x, y0, z)] === 0 || nearPit(x, z, 18) || inMouthZone(x, z, 10)) continue;
+    const sl = slopeAt(x, z), forest = vnoise(x * 0.012, 3.3, z * 0.012, seed + 77), low = y0 <= 6 * S;
+    const roll = pr();
+    if (low && sl < 0.5 && forest > 0.4 && roll < 0.75) { if (room(x, z, 11)) tree(x, z); }
+    else if (roll < (low ? 0.3 : 0.4) && sl < 1.2) {
+      const r = pri(10, 22) * (pr() < 0.12 ? 1.5 : 1);
+      if (!room(x, z, r)) continue;
+      boulder(x, z, r);
+      if (pr() < 0.4) for (let k = pri(1, 2); k > 0; k--) {          // satellite rocks make L-shaped cover
+        const a = pr() * 6.283, r2 = r * 0.6, sx2 = x + Math.cos(a) * r * 1.1, sz2 = z + Math.sin(a) * r * 1.1;
+        if (room(sx2, sz2, r2) && !nearPit(sx2 | 0, sz2 | 0, 18)) boulder(sx2, sz2, r2);
+      }
+    } else if (roll < 0.58 && sl < 0.8) { if (room(x, z, 12)) bush(x, z); }
+    else if (roll < 0.66 && sl < 0.3 && y0 < 12 * S) { if (room(x, z, 30)) logAt(x, z); }
+  }
+
+  // outdoor spawn points on open ground in the margin, facing the hill
+  const outSpawns = [];
+  const clearOf = (x, z) => objs.every((o) => Math.hypot(o.x - x, o.z - z) > o.r + 24);
+  const picks = layout.spawns.map((s) => [(s.tx + M + 0.5) * T, (s.tz + M + 0.5) * T]);
+  for (let k = 0; k < 3; k++) {
+    let best = null;
+    for (let n = 0; n < 600; n++) {
+      const x = 80 + pr() * (sx - 160), z = 80 + pr() * (sz - 160);
+      const d = Math.hypot(Math.max(RX0 - x, 0, x - RX1), Math.max(RZ0 - z, 0, z - RZ1));
+      if (d < 40 || d > FALL + 80 || Math.min(x, sx - x, z, sz - z) < 110 || data[idx(x | 0, surf[(x | 0) + sx * (z | 0)] + 1, z | 0)] !== 0) continue;
+      if (slopeAt(x, z) > 0.25 || !clearOf(x, z) || inMouthZone(x, z, 0)) continue;
+      const dm = Math.min(...picks.map(([px, pz]) => Math.hypot(px - x, pz - z)));
+      if (!best || dm > best.dm) best = { x, z, dm };
+    }
+    if (!best) break;
+    picks.push([best.x, best.z]);
+    const yaw = Math.atan2((RX0 + RX1) / 2 - best.x, -((RZ0 + RZ1) / 2 - best.z));
+    outSpawns.push({ tx: best.x / T - 0.5, tz: best.z / T - 0.5, yaw, ym: (surfAt(best.x, best.z) + 3) * (4 / T) });
+  }
+
   // 6. coarse occupancy grid (1 = brick contains any solid voxel) for empty-space skipping
   const cx = sx / BRICK, cy = sy / BRICK, cz = sz / BRICK;
   const coarse = new Uint8Array(cx * cy * cz);
@@ -417,5 +654,5 @@ export function buildWorld(seed = 1337) {
   }
 
   return { data, size: { x: sx, y: sy, z: sz }, coarse, coarseSize: { x: cx, y: cy, z: cz }, seed,
-           map: MAP, spawns: layout.spawns, start: layout.spawns[0], lights };
+           map: MAP, spawns: spawns.concat(outSpawns), start: spawns[0], lights };
 }
