@@ -74,6 +74,7 @@ export class Player {
     this.coyote = 0;
     this.buffer = 0;
     this.launched = false;    // true after knock(): disables the short-hop cut until we start falling
+    this.slopeBoost = 1;      // compensates the controller's slope shortening (see tick)
     this.stepOffset = 0;      // visual-only smoothing for step-ups
     this.alpha = 1;           // interpolation factor set by the loop
   }
@@ -129,7 +130,10 @@ export class Player {
     }
 
     // ---- move through the physics world
-    const desired = { x: this.vx * dt, y: this.vy * dt, z: this.vz * dt };
+    // The character controller shortens horizontal travel on a slope (it follows the surface), which would slow you
+    // right down on hills. slopeBoost learns how much it shortened the last few ticks and asks for that much more.
+    const boost = this.onGround ? this.slopeBoost : 1;
+    const desired = { x: this.vx * dt * boost, y: this.vy * dt, z: this.vz * dt * boost };
     if (jumped) this.cc.disableSnapToGround(); else this.cc.enableSnapToGround(o.snapDistance);
     this.cc.computeColliderMovement(this.collider, desired);
     const m = this.cc.computedMovement();
@@ -138,8 +142,13 @@ export class Player {
 
     // head bump
     if (desired.y > 0 && m.y < desired.y * 0.5) this.vy = Math.min(this.vy, 0);
-    // keep the slid horizontal velocity so walls don't leave residual push-back
-    this.vx = m.x / dt; this.vz = m.z / dt;
+    // climbing = same heading as asked, but shorter and going up: slope projection, not a wall
+    const mh = Math.hypot(m.x, m.z), dh = Math.hypot(desired.x, desired.z);
+    const climbing = this.onGround && dh > 1e-6 && mh > 1e-6 && m.y > 0.0005 && (m.x * desired.x + m.z * desired.z) / (mh * dh) > 0.98 && mh < dh;
+    const wantBoost = climbing ? Math.min(1.6, (dh / boost) / mh) : 1;
+    this.slopeBoost += (wantBoost - this.slopeBoost) * 0.3;
+    // keep the slid horizontal velocity so walls don't leave residual push-back (but not the slope shortening)
+    if (!climbing) { this.vx = m.x / dt; this.vz = m.z / dt; }
     if (this.onGround && this.vy < 0) this.vy = 0;
 
     // visual step-up smoothing: remember how far the capsule jumped up while grounded
