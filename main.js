@@ -337,7 +337,7 @@ function aimGun() {
   const dl = Math.hypot(...dir) || 1;
   dir = dir.map((v) => v / dl);
 
-  // if the barrel is poking into a wall, fire from the eye instead (the shell will blow up right in front of you)
+  // if the barrel is poking into a wall, fire from the eye instead (the shellgit  will blow up right in front of you)
   let start = barrel;
   const toBarrel = [barrel[0] - eye.x, barrel[1] - eye.y, barrel[2] - eye.z];
   const bl = Math.hypot(...toBarrel) || 1;

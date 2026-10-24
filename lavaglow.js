@@ -112,7 +112,8 @@ export class LavaGlow {
       const tx = ((cx + 0.5) * C / G) | 0, ty = ((Y0 + (cy + 0.5) * C) / G) | 0, tz = ((cz + 0.5) * C / G) | 0;
       if (tx >= nx || ty >= ny || tz >= nz) continue;
       const k = tx + nx * (ty + ny * tz);
-      src.set(k, (src.get(k) || 0) + 1);
+      // was: src.set(k, (src.get(k) || 0) + 1);
+      src.set(k, (src.get(k) || 0) + (lava.glowWeight ? lava.glowWeight(i) : 1));
     }
 
     // ---- 2. blobs: touching emitter texels share one size -> brighter when bigger
@@ -199,8 +200,9 @@ export function warmUpGlow() {
   for (let z = 0; z < size.z; z++) for (let y = 0; y < size.y; y++) world.data[40 + size.x * (y + size.y * z)] = 1;
   const lava = new LavaSim(world, { cell: 2 });
   const glow = new LavaGlow(world, lava);
-  for (let cz = 4; cz < 20; cz++) for (let cx = 4; cx < 16; cx++) for (let cy = 0; cy < 2; cy++) lava.place(cx, cy, cz);
-  lava.place(5, 8, 5);
+  for (let cz = 4; cz < 20; cz++) for (let cx = 4; cx < 16; cx++) for (let cy = 0; cy < 2; cy++) lava.addVolume(lava.idx(cx, cy, cz), 1);
+  lava.addVolume(lava.idx(5, 8, 5), 1);
+  for (let i = 0; i < 60; i++) lava.step();
   for (let i = 0; i < 4; i++) { glow.rev = -1; glow.rebuild(); }
   glow.carved({ x0: 10, y0: 0, z0: 10, x1: 20, y1: 10, z1: 20 });
 }
