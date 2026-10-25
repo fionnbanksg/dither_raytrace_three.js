@@ -2,6 +2,7 @@
 // movement keys are sampled once per physics tick via sample().
 
 const PITCH_LIMIT = 1.54;   // just under 90 degrees
+const NO_KEYS = new Set();  // what sample() sees while the menu is open
 
 export class Input {
   constructor(canvas, opts = {}) {
@@ -16,12 +17,13 @@ export class Input {
     this.fireHeld = 0;                            // 1 / 2 while the left / right button is held
     this._fire = 0;                               // 1 = left click, 2 = right click (only while the mouse is captured)
     this._wheel = 0;                              // accumulated scroll direction (+1 / -1 per notch) while the mouse is captured
+    this.uiOpen = false;                          // the menu is showing: ignore game keys / clicks (set by ui/menu.js)
 
     const block = new Set(['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'ControlLeft', 'Tab']);
 
     addEventListener('keydown', (e) => {
       if (block.has(e.code)) e.preventDefault();
-      if (e.repeat) return;
+      if (this.uiOpen || e.repeat) return;
       this.keys.add(e.code);
       if (e.code === 'Space') this._jumpPressed = true;
       if (e.code === 'KeyF') this._toggleFly = true;
@@ -30,6 +32,7 @@ export class Input {
     addEventListener('blur', () => { this.keys.clear(); this.fireHeld = 0; });
 
     canvas.addEventListener('click', () => {
+      if (this.uiOpen) return;                    // the menu has its own buttons (ui/menu.js)
       if (document.pointerLockElement !== canvas) canvas.requestPointerLock?.();
     });
     canvas.addEventListener('mousedown', (e) => {
@@ -63,6 +66,7 @@ export class Input {
 
   // once per rendered frame: arrow-key look
   frameUpdate(dt) {
+    if (this.uiOpen) return;
     const k = this.keys;
     this.yaw += ((k.has('ArrowRight') ? 1 : 0) - (k.has('ArrowLeft') ? 1 : 0)) * this.keyLook * dt;
     this.pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT,
@@ -71,7 +75,7 @@ export class Input {
 
   // once per physics tick
   sample() {
-    const k = this.keys;
+    const k = this.uiOpen ? NO_KEYS : this.keys;
     const intent = {
       forward: (k.has('KeyW') ? 1 : 0) - (k.has('KeyS') ? 1 : 0),
       strafe:  (k.has('KeyD') ? 1 : 0) - (k.has('KeyA') ? 1 : 0),

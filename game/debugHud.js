@@ -8,7 +8,7 @@ import { raycastVoxels, voxelAt } from '../destruction.js';
 import { M2V, TILE_M } from '../physics.js';
 import { T } from '../world.js';
 import { MAX_PARTICLES } from '../particles.js';
-import { FOV_DEG, DITHER_LEVELS, DITHER_STRENGTH, SHOW_DEBUG } from '../config.js';
+import { settings } from '../settings.js';
 
 // ctx: everything the overlay reads. getShake is a function because `shake` is a changing number in main.js.
 export function createDebugHud({ renderer, canvas, uniforms, world, physics, player, input, eye, projectiles, particles,
@@ -28,7 +28,7 @@ export function createDebugHud({ renderer, canvas, uniforms, world, physics, pla
     const heading = Math.atan2(forward[0], -forward[2]);                    // 0 = facing -Z, like the player's yaw
     const r = canvas.getBoundingClientRect();
     return {
-      gpu: gpuName, calls: renderer.info.render.calls, maxTex3D, fov: FOV_DEG, levels: DITHER_LEVELS, ditherStrength: DITHER_STRENGTH,
+      gpu: gpuName, calls: renderer.info.render.calls, maxTex3D, fov: settings.fov, levels: settings.ditherLevels, ditherStrength: settings.ditherStrength,
       res: [uniforms.uRes.value.x, uniforms.uRes.value.y], canvas: [Math.round(r.width), Math.round(r.height)],
       upscale: (r.height / uniforms.uRes.value.y).toFixed(2),
       lights: uniforms.uLightCount.value, maxLights: MAX_LIGHTS, flashes: flashes.length,
@@ -54,6 +54,6 @@ export function createDebugHud({ renderer, canvas, uniforms, world, physics, pla
       time: performance.now() / 1000,
     };
   });
-  if (debug && SHOW_DEBUG) debug.toggle();
+  if (debug && settings.debug) debug.toggle();
   return debug;
 }

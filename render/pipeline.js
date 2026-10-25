@@ -3,7 +3,8 @@
 
 import * as THREE from 'three';
 import { vert, frag } from '../shader.js';
-import { INTERNAL_HEIGHT, HALF_RES_LIGHT, LIGHT_DIV } from '../config.js';
+import { HALF_RES_LIGHT, LIGHT_DIV } from '../config.js';
+import { internalSize } from '../settings.js';
 
 export function createPipeline({ renderer, canvas, uniforms }) {
   // Light pass: world traced at 1/LIGHT_DIV resolution into a float target; sky / sun / point-light rays are cast there once
@@ -45,9 +46,7 @@ export function createPipeline({ renderer, canvas, uniforms }) {
   lightScene.add(lightQuad);
 
   function resize() {
-    const r = canvas.getBoundingClientRect();
-    const h = INTERNAL_HEIGHT;
-    const w = Math.max(1, Math.round(h * r.width / Math.max(1, r.height)));
+    const [w, h] = internalSize(canvas.getBoundingClientRect());   // height from settings (menu), width follows the aspect
     renderer.setSize(w, h, false);       // false = don't touch CSS size; CSS upscales
     uniforms.uRes.value.set(w, h);
     uniforms.uAspect.value = w / h;

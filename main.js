@@ -16,6 +16,10 @@ import { Minimap } from './minimap.js';
 import { LavaSim } from './lava.js';
 import { skyState, SkyClock } from './sky.js';
 import { LavaGlow, warmUpGlow } from './lavaglow.js';
+import { settings, setSetting, onSettingChange } from './settings.js';
+import { createOverlay } from './ui/overlay.js';
+import { createLoading } from './ui/loading.js';
+import { createMenu } from './ui/menu.js';
 
 // all tunable settings live in config.js
 import {
@@ -23,7 +27,6 @@ import {
   MAX_FRAME_DT,
   BLAST_RADIUS_M,
   BLAST_PUSH,
-  SHAKE_AMOUNT,
   DEBRIS_PER_BLAST,
   SHOTS,
   INHERIT_VELOCITY,
@@ -34,12 +37,27 @@ const canvas = document.getElementById('view');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
 renderer.setPixelRatio(1);
 
+// ---------------------------------------------------------------- UI overlay + loading screen
+// The UI is drawn inside the canvas at the internal resolution and dithered like the world (see ui/overlay.js).
+const overlay = createOverlay({ renderer, canvas });
+const loading = createLoading(overlay);
+loading.begin();
+// Paint the loading screen before each heavy synchronous step (world generation etc. block the page while they run).
+const nextPaint = () => new Promise((res) => requestAnimationFrame(() => { overlay.render(performance.now() / 1000); res(); }))
+  .then(() => new Promise((r) => setTimeout(r, 0)));
+async function stage(label, frac) { loading.set(label, frac); await nextPaint(); }
+
+await stage('GENERATING WORLD', 0.03);
+
 // Same seed => same level on every client. Multiplayer: have the server send this number.
 // Try ?seed=1234 in the URL; with no seed a random one is picked and written to the URL so you can share it.
 const params = new URLSearchParams(location.search);
 const seed = Number.isFinite(parseInt(params.get('seed'), 10)) ? parseInt(params.get('seed'), 10) : (Math.random() * 1e9) | 0;
 if (!params.has('seed')) { params.set('seed', seed); history.replaceState(null, '', '?' + params); }
 const world = buildWorld(seed);
+loading.set('GENERATING WORLD', 0.03, `SEED ${seed}`);
+
+await stage('UPLOADING VOXELS', 0.3);
 
 const { voxelTex, coarseTex, superTex, refreshSuper } = createWorldTextures(world);
 
@@ -71,6 +89,8 @@ const skyU = skyState(skyClock.tod);
 
 const palette = Array.from({ length: 12 }, (_, i) => new THREE.Vector3(...(PALETTE[i] ?? [1, 0, 1])));
 
+await stage('LIGHTING SETUP', 0.45);
+
 // Lights: slot 0 = player torch, then braziers, then shells / explosion flashes (see game/lights.js)
 const lights = createLights(world);
 const { MAX_LIGHTS, lightPos, lightCol, staticLights, BASE_LIGHTS, lightCount, flashes } = lights;
@@ -86,11 +106,14 @@ const uniforms = createUniforms({
 });
 const applySky = (st) => applySkyUniforms(uniforms, st);   // push a sky state into the shader uniforms
 
-const { material, lightMaterial, scene, lightScene, camera, lightRT, lightUniforms, useLightBuffer } = createPipeline({ renderer, canvas, uniforms });
+const { material, lightMaterial, scene, lightScene, camera, lightRT, lightUniforms, useLightBuffer, resize } = createPipeline({ renderer, canvas, uniforms });
+
+await stage('BUILDING COLLISION', 0.55);
 
 // ---------------------------------------------------------------- physics + player
 const physics = await createPhysics(world);   // collision mesh + Rapier world (a second or two)
 
+await stage('WARMING UP', 0.8);
 warmUp();   // JIT the explosion code on a scratch grid so the first real blast doesn't hitch
 warmUpGlow();   // same for the lava glow solver
 
@@ -107,7 +130,7 @@ if (mapCap) mapCap.textContent = `SEED ${seed}`;
 
 const hint = document.getElementById('hint');
 const modeEl = document.getElementById('mapcap');   // reuse the caption under the minimap for the gun mode
-if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · M map · T time of day (normal / fast / paused) · F3 debug · Esc release mouse · Shift+L: clear lava · Scroll wheel (or G): swap grenades / LAVA GUN · Click: fire (lava gun: hold to spray) · Right click: heavy shell (hold to keep firing)';
+if (hint) hint.textContent = 'Esc: menu (settings) · Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · M map · T time of day (normal / fast / paused) · F3 debug · Esc release mouse · Shift+L: clear lava · Scroll wheel (or G): swap grenades / LAVA GUN · Click: fire (lava gun: hold to spray) · Right click: heavy shell (hold to keep firing)';
 
 const stats = { shots: 0, blasts: 0, lastBlast: null };   // counters updated by shoot() / detonate(), shown in the F3 overlay
 
@@ -166,7 +189,7 @@ function detonate(point, normal, radiusM) {
     const s = BLAST_PUSH * k * Math.sqrt(radiusM / BLAST_RADIUS_M);
     player.knock(dx * s, Math.max(dy, 0.35) * s, dz * s);
   }
-  shake = Math.max(shake, SHAKE_AMOUNT * Math.min(1, Math.sqrt(radiusM / BLAST_RADIUS_M)) * Math.max(0, 1 - dist / (radiusM * 6)));
+  shake = Math.max(shake, settings.shake * Math.min(1, Math.sqrt(radiusM / BLAST_RADIUS_M)) * Math.max(0, 1 - dist / (radiusM * 6)));
 }
 
 // ---------------------------------------------------------------- gun + projectiles
@@ -186,7 +209,28 @@ const debug = createDebugHud({ renderer, canvas, uniforms, world, physics, playe
 addEventListener('keydown', (e) => {
   if (e.code === 'KeyM' && !e.repeat) minimap?.toggle();
   if (e.code === 'KeyT' && !e.repeat) { const m = skyClock.cycle(); const h = document.getElementById('hint'); if (h) { const old = h.textContent; h.textContent = 'Time: ' + m; setTimeout(() => { h.textContent = old; }, 1500); } }
-  if (e.code === 'F3') { e.preventDefault(); if (!e.repeat) debug?.toggle(); }
+  if (e.code === 'F3') { e.preventDefault(); if (!e.repeat && debug) { debug.toggle(); setSetting('debug', debug.on); } }
+});
+
+// ---------------------------------------------------------------- menu + settings
+// Settings (settings.js) are edited by the in-game menu (ui/menu.js). Push each change to where it takes effect.
+const BASE_SENS = input.sens;
+function applySettings() {
+  uniforms.uLevels.value = settings.ditherLevels;                       // light pass shares these uniform objects
+  uniforms.uDither.value = settings.ditherStrength;
+  uniforms.uTanHalf.value = Math.tan(THREE.MathUtils.degToRad(settings.fov) / 2);
+  input.sens = BASE_SENS * settings.mouseSens;
+}
+applySettings();
+const menu = createMenu({
+  overlay, canvas, input, getSeed: () => seed,
+  onPlay: () => { canvas.requestPointerLock?.()?.catch?.(() => {}); },   // the browser refuses for ~1 s after Esc: just ignore
+});
+onSettingChange((key, value) => {
+  if (key === 'internalHeight') { overlay.resize(); resize(); }          // new internal resolution: UI buffer, render size, light target
+  if (key === 'debug' && debug && debug.on !== value) debug.toggle();
+  applySettings();
+  menu.refresh();
 });
 
 // ---------------------------------------------------------------- lava
@@ -330,7 +374,18 @@ function frame(now) {
   minimap?.draw({ x: mToVoxX(player.x), z: mToVoxZ(player.z), yaw: input.yaw }, time);
 
   renderScene();
+  if (menu.update(dt)) overlay.render(time);                  // dithered UI on top of the world (only while the menu is up)
   debug?.frame(rawMs, performance.now() - cpuStart);
   requestAnimationFrame(frame);
 }
+
+// Compile both shaders now (a few seconds) instead of hitching on the first frame, then hand over to the game.
+await stage('COMPILING SHADERS', 0.88);
+try { await renderer.compileAsync(lightScene, camera); await renderer.compileAsync(scene, camera); } catch (e) { console.warn('shader precompile failed', e); }
+loading.set('READY', 1);
+await nextPaint();
+loading.end();
+overlay.onResize = () => menu.refresh();
+document.body.classList.remove('loading');
+last = performance.now();
 requestAnimationFrame(frame);

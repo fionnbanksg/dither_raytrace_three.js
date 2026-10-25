@@ -1,4 +1,4 @@
-# Refactor plan (staged)  -  stages 1-5 complete
+# Refactor plan (staged)  -  stages 1-5 complete, UI stage 1 done
 
 ## Project map (where to look)
 | I want to change... | open |
@@ -13,6 +13,7 @@
 | aiming, firing, gun animation | `game/weapons.js` |
 | F3 debug info | `game/debugHud.js` |
 | explosions, per-frame order, startup | `main.js` |
+| in-game UI (loading, menu, settings) | `ui/*.js`, `settings.js` |
 | world gen / physics / lava / player | `world.js`, `physics.js`, `lava.js`, `player.js` (untouched) |
 
 
@@ -85,3 +86,20 @@ Order matters a little (e.g. camera before lights, because the torch uses the ca
 ## Later / optional
 - `world.js` (657 lines) and `physics.js` (368), `lava.js` (381): split only if you need to touch them.
 - `test.html` (611 lines) looks like a standalone test page; check whether it is still used.
+
+## UI stage 1 - dithered in-canvas UI  [DONE]
+The UI is drawn INSIDE the WebGL canvas at the internal resolution and goes through the same level quantisation + 8x8 Bayer
+dither as the world (no HTML on top). A pixel buffer (`ui/gfx.js`, 5x7 font in `ui/font.js`) is uploaded as a texture and
+composited by a small second pass (`ui/overlay.js`), which also dissolves the world darker behind menus.
+
+| file | what is in it |
+|---|---|
+| `settings.js` | player settings (defaults from `config.js`), saved to localStorage, `onSettingChange` |
+| `ui/overlay.js` | overlay shader pass, UI buffer texture, ember loading backdrop |
+| `ui/gfx.js`, `ui/font.js`, `ui/theme.js` | rect / dither-fill / text / bevel frame, font, colours |
+| `ui/loading.js` | loading screen; `main.js` calls `stage('LABEL', 0..1)` between start-up steps |
+| `ui/menu.js` | title / pause menu, settings page, controls page. Add a setting: `DEFAULTS` + `settingsRows()` + react in `main.js` |
+
+Menu opens whenever the mouse is not captured (Esc, alt-tab, first load). `input.uiOpen` stops game input while it is up.
+Not yet in the UI (stage 2): minimap, crosshair, hint line and F3 overlay are still the old HTML; light quality
+(HALF_RES_LIGHT / LIGHT_DIV) and the day-night mode are not in the settings page yet.
