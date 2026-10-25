@@ -14,7 +14,7 @@ import { PALETTE } from './world.js';
 
 export const MAX_PARTICLES = 768;
 export const TEXELS = 3;
-const EXTRA_SLOTS = 8;                       // room left over for cubes main.js hands to pack() (projectiles)
+const EXTRA_SLOTS = 200;                     // room left over for cubes main.js hands to pack() (projectiles, lava droplets, bots)
 
 const rnd = (a = 0, b = 1) => a + Math.random() * (b - a);
 const clamp01 = (v) => Math.min(1, Math.max(0, v));

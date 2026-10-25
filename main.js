@@ -11,6 +11,7 @@ import { Particles } from './particles.js';
 import { Projectiles } from './projectiles.js';
 import { createLights } from './game/lights.js';
 import { createWeapons } from './game/weapons.js';
+import { Bots } from './game/bots.js';
 import { createDebugHud } from './game/debugHud.js';
 import { Minimap } from './minimap.js';
 import { LavaSim } from './lava.js';
@@ -130,7 +131,7 @@ if (mapCap) mapCap.textContent = `SEED ${seed}`;
 
 const hint = document.getElementById('hint');
 const modeEl = document.getElementById('mapcap');   // reuse the caption under the minimap for the gun mode
-if (hint) hint.textContent = 'Esc: menu (settings) · Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · M map · T time of day (normal / fast / paused) · F3 debug · Esc release mouse · Shift+L: clear lava · Scroll wheel (or G): swap grenades / LAVA GUN · Click: fire (lava gun: hold to spray) · Right click: heavy shell (hold to keep firing)';
+if (hint) hint.textContent = 'Esc: menu (settings) · Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · M map · T time of day (normal / fast / paused) · F3 debug · Esc release mouse · Shift+L: clear lava · Scroll wheel (or G): swap grenades / LAVA GUN · Click: fire (lava gun: hold to spray) · Right click: heavy shell (hold to keep firing) · B: drop a bot where you look';
 
 const stats = { shots: 0, blasts: 0, lastBlast: null };   // counters updated by shoot() / detonate(), shown in the F3 overlay
 
@@ -146,7 +147,7 @@ function uploadGlowBox(box) { uploadBox(glowTex, lavaGlow.data, lavaGlow.size, b
 
 // Carve the crater, throw particles, flash the lights, knock the player back.
 // point / normal: where the shell hit (voxels). normal = [0,0,0] means an airburst.
-function detonate(point, normal, radiusM) {
+function detonate(point, normal, radiusM, owner = null) {   // owner: the bot that fired it (null = the player)
   const R = radiusM * M2V;                                    // metres -> voxels
   const c = point.map((p, i) => p + normal[i] * R * 0.3);     // nudge out of the wall so the crater opens into the room
   const debris = [];
@@ -172,6 +173,7 @@ function detonate(point, normal, radiusM) {
   }
 
   stats.blasts++;
+  bots.blast(c, radiusM, owner);                                   // hurt / throw bots and corpses
   particles.burst(c, normal[0] || normal[1] || normal[2] ? normal : [0, 1, 0], radiusM / BLAST_RADIUS_M, debris);
 
   // light flash + knockback
@@ -196,18 +198,23 @@ function detonate(point, normal, radiusM) {
 const eye = new THREE.Vector3();   // camera position in voxels, refreshed by player.eyeVoxels(eye)
 let shake = 0;                     // camera shake, decays after a blast (set by detonate(), used by the frame loop)
 const projectiles = new Projectiles(world, {
-  onImpact: ({ point, normal, radiusM }) => detonate(point, normal, radiusM),
+  onImpact: ({ point, normal, radiusM, owner }) => detonate(point, normal, radiusM, owner),
   onTrail: (x, y, z, big) => particles.trail(x, y, z, big),
 });
 
 const weapons = createWeapons({ world, player, input, eye, lava, projectiles, stats, uniforms });
 const { gun, lavaGun, aimGun, shoot, selectGun } = weapons;   // gun = shared gun state, see game/weapons.js
 
+// Bots fire the same projectiles / lava gun as the player. ?bots=N sets how many (default 3, max 10); B drops one where you look.
+const bots = new Bots({ world, solid: solidVoxel, projectiles, lavaGun, player, count: num('bots', 3) });
+projectiles.hitBots = (x, y, z, dir, len, owner) => bots.rayHit(x, y, z, dir, len, owner);
+
 // ---------------------------------------------------------------- F3 debug overlay + hotkeys
 const debug = createDebugHud({ renderer, canvas, uniforms, world, physics, player, input, eye, projectiles, particles,
                                stats, flashes, MAX_LIGHTS, gun, getShake: () => shake });
 addEventListener('keydown', (e) => {
   if (e.code === 'KeyM' && !e.repeat) minimap?.toggle();
+  if (e.code === 'KeyB' && !e.repeat && input.locked) { const { forward } = Player.basis(input.yaw, input.pitch); bots.spawnFromView([eye.x, eye.y, eye.z], forward); }
   if (e.code === 'KeyT' && !e.repeat) { const m = skyClock.cycle(); const h = document.getElementById('hint'); if (h) { const old = h.textContent; h.textContent = 'Time: ' + m; setTimeout(() => { h.textContent = old; }, 1500); } }
   if (e.code === 'F3') { e.preventDefault(); if (!e.repeat && debug) { debug.toggle(); setSetting('debug', debug.on); } }
 });
@@ -264,6 +271,7 @@ function stepSimulation(dt) {
     acc += dt;
     while (acc >= FIXED_DT) {
       player.tick(input.sample());
+      bots.tick(FIXED_DT);
       projectiles.update(FIXED_DT);
       lavaGun.update(FIXED_DT);
       acc -= FIXED_DT;
@@ -338,7 +346,7 @@ function updateLava(dt) {
 function updateParticles(dt) {
     // particles: simulate, pack, upload only while something is alive
     particles.update(dt);
-    const shells = projectiles.cubes(acc / FIXED_DT).concat(lavaGun.cubes(acc / FIXED_DT));
+    const shells = bots.cubes(acc / FIXED_DT).concat(projectiles.cubes(acc / FIXED_DT), lavaGun.cubes(acc / FIXED_DT));
     if (particles.count > 0 || shells.length > 0 || particlesLive) {
       particles.pack(shells);
       uniforms.uParticleCount.value = particles.packed;

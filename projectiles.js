@@ -16,13 +16,14 @@ export class Projectiles {
     this.onImpact = onImpact;
     this.onTrail = onTrail;
     this.list = [];
+    this.hitBots = null;       // optional (x, y, z, dir, len, owner) -> distance to the first bot hit, or null (see game/bots.js)
   }
 
   // pos: voxels. vel: voxels/s. gravity: voxels/s^2 (positive = down)
-  spawn(pos, vel, { gravity, radiusM, big = false }) {
+  spawn(pos, vel, { gravity, radiusM, big = false, owner = null }) {
     this.list.push({
       x: pos[0], y: pos[1], z: pos[2], px: pos[0], py: pos[1], pz: pos[2],
-      vx: vel[0], vy: vel[1], vz: vel[2], g: gravity, radiusM, big,
+      vx: vel[0], vy: vel[1], vz: vel[2], g: gravity, radiusM, big, owner,
       age: 0, trailAcc: 0, seed: Math.random(),
     });
   }
@@ -41,7 +42,9 @@ export class Projectiles {
       const dir = [dx / len, dy / len, dz / len];
 
       // swept test: the whole step is cast as a ray, so fast shots can't tunnel through thin walls
-      const hit = raycastVoxels(world, [p.x, p.y, p.z], dir, len);
+      let hit = raycastVoxels(world, [p.x, p.y, p.z], dir, len);
+      const bt = this.hitBots ? this.hitBots(p.x, p.y, p.z, dir, hit ? hit.t : len, p.owner) : null;   // a bot in the way blows it up first
+      if (bt !== null) hit = { t: bt, normal: [0, 0, 0], point: [p.x + dir[0] * bt, p.y + dir[1] * bt, p.z + dir[2] * bt] };
       const travel = hit ? hit.t : len;
 
       // flame / smoke trail along the path actually flown
@@ -56,7 +59,7 @@ export class Projectiles {
         let n = hit.normal;
         if (n[0] === 0 && n[1] === 0 && n[2] === 0) n = [-dir[0], -dir[1], -dir[2]];   // started inside stone: face back along the shot
         list.splice(i, 1);
-        this.onImpact({ point: hit.point, normal: n, radiusM: p.radiusM, big: p.big });
+        this.onImpact({ point: hit.point, normal: n, radiusM: p.radiusM, big: p.big, owner: p.owner });
         continue;
       }
 
@@ -66,7 +69,7 @@ export class Projectiles {
       if (outside) { list.splice(i, 1); continue; }
       if (p.age > MAX_LIFE) {                              // never hit anything: airburst
         list.splice(i, 1);
-        this.onImpact({ point: [p.x, p.y, p.z], normal: [0, 0, 0], radiusM: p.radiusM, big: p.big });
+        this.onImpact({ point: [p.x, p.y, p.z], normal: [0, 0, 0], radiusM: p.radiusM, big: p.big, owner: p.owner });
       }
     }
   }
