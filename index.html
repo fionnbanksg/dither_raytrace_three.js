@@ -6,8 +6,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: monospace; color: #fff; }
-  #viewport { position: fixed; inset: 0; }
-  #view { display: block; width: 100%; height: 100%; image-rendering: pixelated; image-rendering: crisp-edges; cursor: crosshair; }
+  #viewport { position: fixed; inset: 0; overflow: hidden; }
+  #view { position: absolute; inset: 0; display: block; width: 100%; height: 100%; max-width: none; object-fit: fill; aspect-ratio: auto; image-rendering: pixelated; image-rendering: crisp-edges; cursor: crosshair; }
   #crosshair { position: absolute; left: 50%; top: 50%; width: 14px; height: 14px; margin: -7px 0 0 -7px; pointer-events: none; opacity: .75; mix-blend-mode: difference;
     background: linear-gradient(#fff,#fff) center/2px 100% no-repeat, linear-gradient(#fff,#fff) center/100% 2px no-repeat; -webkit-mask: radial-gradient(circle, transparent 2px, #000 3px); mask: radial-gradient(circle, transparent 2px, #000 3px); }
   body.loading #crosshair, body.loading #hint, body.loading #topright, body.menu #crosshair, body.menu #hint { display: none; }

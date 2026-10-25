@@ -43,9 +43,20 @@ export function resetSettings() {
   for (const k of Object.keys(DEFAULTS)) setSetting(k, DEFAULTS[k]);
 }
 
-// Internal render size for a canvas rect: height from settings (0 = native), width follows the aspect ratio.
-export function internalSize(rect) {
-  const h = Math.max(1, settings.internalHeight || Math.round(rect.height));
-  const w = Math.max(1, Math.round(h * rect.width / Math.max(1, rect.height)));
+// Size of the area the game fills (CSS pixels). Measured from the #viewport container (always the full window),
+// never from the canvas itself, so the canvas's own drawing-buffer size can never feed back into the maths.
+export function viewSize() {
+  const el = document.getElementById('viewport');
+  const w = el?.clientWidth || window.innerWidth || 1;
+  const h = el?.clientHeight || window.innerHeight || 1;
+  return { width: Math.max(1, w), height: Math.max(1, h) };
+}
+
+// Internal render size: height from settings (0 = native), width follows the window's aspect ratio, so changing the
+// resolution only changes how many pixels there are; the picture is always upscaled (by CSS) to fill the window.
+export function internalSize() {
+  const v = viewSize();
+  const h = Math.max(1, settings.internalHeight || Math.round(v.height));
+  const w = Math.max(1, Math.round(h * v.width / v.height));
   return [w, h];
 }

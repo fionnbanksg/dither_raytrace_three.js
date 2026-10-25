@@ -22,7 +22,7 @@ const CONTROLS = [
   ['T', 'TIME OF DAY'], ['F3', 'DEBUG OVERLAY'], ['ESC', 'THIS MENU'],
 ];
 
-export function createMenu({ overlay, canvas, input, onPlay, getSeed }) {
+export function createMenu({ overlay, canvas, input, onPlay, onNewGame, getSeed }) {
   const m = {
     open: false, started: false,       // started = the player has captured the mouse at least once (title -> pause wording)
     page: 'main', sel: 0, drag: null, mx: 0, my: 0, mouseSeen: false, dirty: true,
@@ -51,17 +51,24 @@ export function createMenu({ overlay, canvas, input, onPlay, getSeed }) {
   function mainRows() {
     return [
       { type: 'button', label: m.started ? 'RESUME' : 'PLAY', action: () => onPlay() },
+      { type: 'button', label: 'NEW GAME', action: () => (m.started ? go('confirm') : onNewGame()) },
       { type: 'button', label: 'SETTINGS', action: () => go('settings') },
       { type: 'button', label: 'CONTROLS', action: () => go('controls') },
     ];
   }
 
-  function go(page) { m.page = page; m.sel = 0; m.dirty = true; }
+  function go(page) { m.page = page; m.sel = page === 'confirm' ? 1 : 0;   // confirm page starts on CANCEL
+    m.dirty = true; }
 
   // ------------------------------------------------------------ value helpers
+  const nearestIdx = (it, v) => {
+    let best = 0;
+    it.values.forEach((x, i) => { if (Math.abs(x - v) < Math.abs(it.values[best] - v)) best = i; });
+    return best;
+  };
   const sliderT = (it) => {
     const v = settings[it.key];
-    if (it.values) return Math.max(0, it.values.indexOf(v)) / (it.values.length - 1);
+    if (it.values) return nearestIdx(it, v) / (it.values.length - 1);
     return (v - it.min) / (it.max - it.min);
   };
   const sliderFromT = (it, t) => {
@@ -74,7 +81,7 @@ export function createMenu({ overlay, canvas, input, onPlay, getSeed }) {
     if (it.type === 'toggle') return setSetting(it.key, !settings[it.key]);
     if (it.type !== 'slider') return;
     if (it.values) {
-      const i = Math.max(0, Math.min(it.values.length - 1, Math.max(0, it.values.indexOf(settings[it.key])) + dir));
+      const i = Math.max(0, Math.min(it.values.length - 1, nearestIdx(it, settings[it.key]) + dir));
       setSetting(it.key, it.values[i]);
     } else {
       setSetting(it.key, Math.max(it.min, Math.min(it.max, +(settings[it.key] + dir * it.step).toFixed(4))));
@@ -101,6 +108,13 @@ export function createMenu({ overlay, canvas, input, onPlay, getSeed }) {
     let rows, title, sub = null, info = null;
     if (m.page === 'settings') { rows = settingsRows(); title = 'SETTINGS'; }
     else if (m.page === 'controls') { rows = [{ type: 'button', label: 'BACK', action: () => go('main') }]; title = 'CONTROLS'; }
+    else if (m.page === 'confirm') {
+      rows = [
+        { type: 'button', label: 'START NEW GAME', action: () => onNewGame() },
+        { type: 'button', label: 'CANCEL', action: () => go('main') },
+      ];
+      title = 'NEW GAME?'; sub = 'THIS WORLD WILL BE REPLACED';
+    }
     else { rows = mainRows(); title = 'DITHER-VOX'; sub = m.started ? 'PAUSED' : 'CLICK PLAY TO START'; }
 
     const titleS = m.page === 'main' ? s * 3 : s * 2;
@@ -170,7 +184,7 @@ export function createMenu({ overlay, canvas, input, onPlay, getSeed }) {
 
     if (m.page === 'settings') {
       const rect = canvas.getBoundingClientRect();
-      const [iw, ih] = internalSize(rect);
+      const [iw, ih] = internalSize();
       gfx.textCentre(`RENDER ${iw}X${ih}  UPSCALE X${(rect.height / ih).toFixed(2)}`, w / 2, y + 4 * s, s, theme.dim);
     }
     if (m.page === 'main') gfx.textRight(`SEED ${getSeed()}`, px + pw - pad, py + ph - 9 * s, s, theme.dim);

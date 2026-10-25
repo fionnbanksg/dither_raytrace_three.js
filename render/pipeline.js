@@ -46,10 +46,10 @@ export function createPipeline({ renderer, canvas, uniforms }) {
   lightScene.add(lightQuad);
 
   function resize() {
-    const [w, h] = internalSize(canvas.getBoundingClientRect());   // height from settings (menu), width follows the aspect
+    const [w, h] = internalSize();   // height from settings (menu), width follows the window aspect
     renderer.setSize(w, h, false);       // false = don't touch CSS size; CSS upscales
     uniforms.uRes.value.set(w, h);
-    uniforms.uAspect.value = w / h;
+    uniforms.uAspect.value = w / h;   // light pass uses this; the full-res pass uses uRes.x / uRes.y (same value)
     const lw = Math.max(1, Math.ceil(w / LIGHT_DIV)), lh = Math.max(1, Math.ceil(h / LIGHT_DIV));
     lightRT.setSize(lw, lh);
     uniforms.uResLow.value.set(lw, lh);

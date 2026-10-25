@@ -225,6 +225,14 @@ applySettings();
 const menu = createMenu({
   overlay, canvas, input, getSeed: () => seed,
   onPlay: () => { canvas.requestPointerLock?.()?.catch?.(() => {}); },   // the browser refuses for ~1 s after Esc: just ignore
+  // New game: the world, textures and physics are all built at startup, so the cleanest reset is a reload with no
+  // ?seed= (a fresh random one is picked and written to the URL). Settings are kept (localStorage).
+  onNewGame: () => {
+    const q = new URLSearchParams(location.search);
+    q.delete('seed'); q.delete('spawn');
+    const qs = q.toString();
+    location.href = location.pathname + (qs ? '?' + qs : '');
+  },
 });
 onSettingChange((key, value) => {
   if (key === 'internalHeight') { overlay.resize(); resize(); }          // new internal resolution: UI buffer, render size, light target

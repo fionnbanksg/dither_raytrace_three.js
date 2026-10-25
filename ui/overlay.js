@@ -80,7 +80,7 @@ export function createOverlay({ renderer, canvas }) {
   let tex = null;
   // Match the game's internal resolution (same maths as render/pipeline.js resize()).
   o.resize = () => {
-    const [w, h] = internalSize(canvas.getBoundingClientRect());
+    const [w, h] = internalSize();
     if (w === o.w && h === o.h && tex) return;
     o.w = w; o.h = h;
     renderer.setSize(w, h, false);
