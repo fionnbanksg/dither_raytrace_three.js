@@ -1,45 +1,33 @@
 import * as THREE from 'three';
-import { buildWorld, PALETTE, T, BRICK } from './world.js';
-import { vert, frag } from './shader.js';
+import { buildWorld, PALETTE, T } from './world.js';
+import { createWorldTextures, createGlowTexture, createParticleTexture, createTextureUploader } from './render/textures.js';
+import { createUniforms, applySkyUniforms } from './render/uniforms.js';
+import { createPipeline } from './render/pipeline.js';
 import { Player } from './player.js';
 import { Input } from './input.js';
 import { createPhysics, FIXED_DT, TILE_M, M2V, mToVoxX, mToVoxY, mToVoxZ } from './physics.js';
-import { explode, raycastVoxels, voxelAt, warmUp } from './destruction.js';
-import { Particles, MAX_PARTICLES, TEXELS } from './particles.js';
+import { explode, voxelAt, warmUp } from './destruction.js';
+import { Particles } from './particles.js';
 import { Projectiles } from './projectiles.js';
-import { DebugOverlay } from './debug.js';
+import { createLights } from './game/lights.js';
+import { createWeapons } from './game/weapons.js';
+import { createDebugHud } from './game/debugHud.js';
 import { Minimap } from './minimap.js';
 import { LavaSim } from './lava.js';
 import { skyState, SkyClock } from './sky.js';
 import { LavaGlow, warmUpGlow } from './lavaglow.js';
-import { LavaGun } from './lavagun.js';
 
-// ---------------------------------------------------------------- settings
-const INTERNAL_HEIGHT = 500;   // render resolution (width follows aspect ratio)
-const HALF_RES_LIGHT  = true;  // shadow / light rays run at half resolution and neighbouring pixels reuse them (false = per-pixel rays, slower)
-const LIGHT_DIV       = 2;     // light pass resolution divisor (2 = half; the full-res pass still traces, AOs and dithers every pixel)
-const DITHER_LEVELS   = 14;    // colour levels per channel (lower = grittier)
-const DITHER_STRENGTH = 0.7;   // 0 = flat banding, 1 = full Bayer pattern
-const FOV_DEG         = 70;    // vertical FOV
-const MINIMAP_FOG    = false; // true = the map is only revealed around where you have walked
-const SHOW_DEBUG      = false; // start with the F3 debug overlay open
-const MAX_FRAME_DT    = 0.1;   // clamp to avoid a spiral of death after a tab switch
-const BLAST_RADIUS_M  = 2.0;   // left click: crater radius in metres (a tile is 4 m wide)
-const BIG_BLAST_MUL   = 1.8;   // right click: bigger blast
-const BLAST_PUSH      = 13;    // m/s of knockback at point-blank range
-const FLASH_LIFE      = 1.4;   // seconds the explosion light lasts (it lingers while the fire burns)
-const FLASH_PEAK      = 14;    // explosion light intensity (braziers are 3, torch 2.2)
-const SHAKE_AMOUNT    = 1.0;   // camera shake strength for a nearby blast (0 = off)
-const DEBRIS_PER_BLAST = 56;   // chunks of the destroyed material thrown out (max)
-
-// gun: left click = grenade, right click = heavy shell (slower, bigger, drops more). Hold to keep firing.
-const SHOTS = {
-  small: { speed: 34, gravity: 6.0, radiusM: BLAST_RADIUS_M,                 cooldown: 0.32, kick: 1.0, big: false },
-  big:   { speed: 22, gravity: 6.0, radiusM: BLAST_RADIUS_M * BIG_BLAST_MUL, cooldown: 0.90, kick: 1.8, big: true  },
-};
-const INHERIT_VELOCITY = 1.0;  // fraction of the player's own velocity added to the shot
-const AIM_CONVERGE_M   = 40;   // the barrel is off-centre, so shots are aimed at what the crosshair sees (up to this far)
-const GUN_TIP = [4.8, -4.2, 24];   // muzzle position in camera space (voxels): x right, y up, z forward
+// all tunable settings live in config.js
+import {
+  MINIMAP_FOG,
+  MAX_FRAME_DT,
+  BLAST_RADIUS_M,
+  BLAST_PUSH,
+  SHAKE_AMOUNT,
+  DEBRIS_PER_BLAST,
+  SHOTS,
+  INHERIT_VELOCITY,
+} from './config.js';
 
 // ---------------------------------------------------------------- renderer
 const canvas = document.getElementById('view');
@@ -53,48 +41,7 @@ const seed = Number.isFinite(parseInt(params.get('seed'), 10)) ? parseInt(params
 if (!params.has('seed')) { params.set('seed', seed); history.replaceState(null, '', '?' + params); }
 const world = buildWorld(seed);
 
-const voxelTex = new THREE.Data3DTexture(world.data, world.size.x, world.size.y, world.size.z);
-voxelTex.format = THREE.RedFormat;
-voxelTex.type = THREE.UnsignedByteType;
-voxelTex.minFilter = voxelTex.magFilter = THREE.NearestFilter;
-voxelTex.unpackAlignment = 1;
-voxelTex.needsUpdate = true;   // set again after editing world.data at runtime
-
-// coarse occupancy grid (8^3 bricks) used by the shader to skip empty space
-const coarseTex = new THREE.Data3DTexture(world.coarse, world.coarseSize.x, world.coarseSize.y, world.coarseSize.z);
-coarseTex.format = THREE.RedFormat;
-coarseTex.type = THREE.UnsignedByteType;
-coarseTex.minFilter = coarseTex.magFilter = THREE.NearestFilter;
-coarseTex.unpackAlignment = 1;
-coarseTex.needsUpdate = true;   // set again (and rebuild world.coarse) after editing voxels
-
-// third traversal level: 1 byte per 4x4x4 coarse bricks (32^3 voxels), 1 = contains stone. Lets the shader hop over big
-// empty spaces. Kept in sync with the coarse grid by refreshSuper(box) wherever coarseTex is re-uploaded.
-const SUPER = 4;
-const superSize = { x: Math.ceil(world.coarseSize.x / SUPER), y: Math.ceil(world.coarseSize.y / SUPER), z: Math.ceil(world.coarseSize.z / SUPER) };
-const superData = new Uint8Array(superSize.x * superSize.y * superSize.z);
-const superTex = new THREE.Data3DTexture(superData, superSize.x, superSize.y, superSize.z);
-superTex.format = THREE.RedFormat;
-superTex.type = THREE.UnsignedByteType;
-superTex.minFilter = superTex.magFilter = THREE.NearestFilter;
-superTex.unpackAlignment = 1;
-function refreshSuper(box) {   // box in voxels, or null for the whole grid
-  const cs = world.coarseSize, W = BRICK * SUPER;
-  const x0 = box ? Math.max(0, Math.floor(box.x0 / W)) : 0, x1 = box ? Math.min(superSize.x - 1, Math.floor((box.x1 - 1) / W)) : superSize.x - 1;
-  const y0 = box ? Math.max(0, Math.floor(box.y0 / W)) : 0, y1 = box ? Math.min(superSize.y - 1, Math.floor((box.y1 - 1) / W)) : superSize.y - 1;
-  const z0 = box ? Math.max(0, Math.floor(box.z0 / W)) : 0, z1 = box ? Math.min(superSize.z - 1, Math.floor((box.z1 - 1) / W)) : superSize.z - 1;
-  for (let sz = z0; sz <= z1; sz++) for (let sy = y0; sy <= y1; sy++) for (let sx = x0; sx <= x1; sx++) {
-    let any = 0;
-    const bz1 = Math.min(cs.z, (sz + 1) * SUPER), by1 = Math.min(cs.y, (sy + 1) * SUPER), bx1 = Math.min(cs.x, (sx + 1) * SUPER);
-    scan: for (let bz = sz * SUPER; bz < bz1; bz++) for (let by = sy * SUPER; by < by1; by++) {
-      let i = sx * SUPER + cs.x * (by + cs.y * bz);
-      for (let bx = sx * SUPER; bx < bx1; bx++, i++) if (world.coarse[i]) { any = 1; break scan; }
-    }
-    superData[sx + superSize.x * (sy + superSize.y * sz)] = any;
-  }
-  superTex.needsUpdate = true;
-}
-refreshSuper(null);
+const { voxelTex, coarseTex, superTex, refreshSuper } = createWorldTextures(world);
 
 const gl = renderer.getContext();
 const maxTex3D = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE);
@@ -114,12 +61,7 @@ const solidVoxel = (x, y, z) => {
 const LAVA_GLOW_COL = new THREE.Vector3(1.0, 0.38, 0.09).multiplyScalar(3.0);   // colour * strength of the glow
 const lava = new LavaSim(world, { cell: 2, width: 1, viscosity: 0.6, reach: 8, period: 15, passes: 15 });
 const lavaGlow = new LavaGlow(world, lava);
-const glowTex = new THREE.Data3DTexture(lavaGlow.data, lavaGlow.nx, lavaGlow.ny, lavaGlow.nz);
-glowTex.format = THREE.RedFormat;
-glowTex.type = THREE.UnsignedByteType;
-glowTex.minFilter = glowTex.magFilter = THREE.LinearFilter;   // trilinear: smooth falloff between texels
-glowTex.unpackAlignment = 1;
-glowTex.needsUpdate = true;
+const glowTex = createGlowTexture(lavaGlow);
 
 // Day / night clock. ?time=0.3 sets the start (0 sunrise, .25 noon, .5 sunset, .75 midnight), ?day=240 the cycle length in seconds (0 = frozen).
 const num = (k, d) => (Number.isFinite(parseFloat(params.get(k))) ? parseFloat(params.get(k)) : d);
@@ -129,131 +71,22 @@ const skyU = skyState(skyClock.tod);
 
 const palette = Array.from({ length: 12 }, (_, i) => new THREE.Vector3(...(PALETTE[i] ?? [1, 0, 1])));
 
-// Lights: index 0 is the player's torch (follows the camera), the rest come from the world.
-const MAX_LIGHTS = 8;
-const lightPos = Array.from({ length: MAX_LIGHTS }, () => new THREE.Vector3());
-const lightCol = Array.from({ length: MAX_LIGHTS }, () => new THREE.Vector3());
-const torchBase = new THREE.Vector3(1.0, 0.85, 0.6).multiplyScalar(2.2);
-const staticLights = world.lights.slice(0, MAX_LIGHTS - 1).map((l) => ({
-  base: new THREE.Vector3(...l.color).multiplyScalar(l.intensity),
-  anchor: l.anchor,   // flame voxel; when an explosion removes it the light goes out
-  dead: false,
-}));
-world.lights.slice(0, MAX_LIGHTS - 1).forEach((l, i) => lightPos[i + 1].set(...l.pos));
-const BASE_LIGHTS = 1 + staticLights.length;   // torch + braziers; slots after these are shells / explosion flashes (lava glows via the glow field, not a light)
-const lightCount = BASE_LIGHTS;
+// Lights: slot 0 = player torch, then braziers, then shells / explosion flashes (see game/lights.js)
+const lights = createLights(world);
+const { MAX_LIGHTS, lightPos, lightCol, staticLights, BASE_LIGHTS, lightCount, flashes } = lights;
 
 // Explosion particles live on the CPU; their packed state is uploaded as a small float texture
 // that the shader reads (see applyParticles in shader.js).
 const particles = new Particles(solidVoxel, M2V);
-const particleTex = new THREE.DataTexture(particles.data, TEXELS, MAX_PARTICLES, THREE.RGBAFormat, THREE.FloatType);
-particleTex.minFilter = particleTex.magFilter = THREE.NearestFilter;
-particleTex.generateMipmaps = false;
-particleTex.needsUpdate = true;
+const particleTex = createParticleTexture(particles);
 
-const uniforms = {
-  uVoxels:   { value: voxelTex },
-  uCoarse:   { value: coarseTex },
-  uSuper:    { value: superTex },
-  uLightTex: { value: null },                // set below: the half-res light pass target
-  uResLow:   { value: new THREE.Vector2(1, 1) },
-  uAspect:   { value: 1 },
-  uBlock:    { value: T / 16 },    // blocky colour-variation cell size in voxels
-  uSize:     { value: new THREE.Vector3(world.size.x, world.size.y, world.size.z) },
-  uCamPos:   { value: new THREE.Vector3() },
-  uCamFwd:   { value: new THREE.Vector3(0, 0, -1) },
-  uCamRight: { value: new THREE.Vector3(1, 0, 0) },
-  uCamUp:    { value: new THREE.Vector3(0, 1, 0) },
-  uRes:      { value: new THREE.Vector2(1, 1) },
-  uTanHalf:  { value: Math.tan(THREE.MathUtils.degToRad(FOV_DEG) / 2) },
-  uTime:     { value: 0 },
-  uLevels:   { value: DITHER_LEVELS },
-  uAmbient:  { value: 0.07 },
-  uSoft:     { value: 0.8 * (T / 4) },  // soft-shadow jitter radius in voxels (0 = hard shadows)
-  uEmissive: { value: 1.4 },
-  uDither:   { value: DITHER_STRENGTH },
-  uInvScale: { value: 4 / T },
-  uLightPos:   { value: lightPos },
-  uLightCol:   { value: lightCol },
-  uLightCount: { value: lightCount },
-  uPalette:  { value: palette },
-  uParticles: { value: particleTex },
-  uGunOff: { value: new THREE.Vector3() },
-  uMuzzle: { value: 0 },
-  uGunType: { value: 0 },
-  uParticleCount: { value: 0 },
-  uPBound: { value: new THREE.Vector4() },
-  uGlow: { value: glowTex },
-  uGlowCol: { value: LAVA_GLOW_COL },
-  uGlowScale: { value: lavaGlow.max },
-  uGlowTexel: { value: lavaGlow.G },
-  uSunDir: { value: v3(skyU.sunDir) }, uMoonDir: { value: v3(skyU.moonDir) },
-  uCelLightDir: { value: v3(skyU.lightDir) }, uCelLightCol: { value: v3(skyU.lightCol) },
-  uSkyAmb: { value: v3(skyU.skyAmb) }, uZenith: { value: v3(skyU.zenith) }, uHorizon: { value: v3(skyU.horizon) },
-  uDusk: { value: v3(skyU.dusk) }, uSunDisc: { value: v3(skyU.sunDisc) },
-  uNight: { value: skyU.night }, uSkyRot: { value: new THREE.Vector2(...skyU.rot) },
-};
-
-function applySky(st) {
-  uniforms.uSunDir.value.set(...st.sunDir); uniforms.uMoonDir.value.set(...st.moonDir);
-  uniforms.uCelLightDir.value.set(...st.lightDir); uniforms.uCelLightCol.value.set(...st.lightCol);
-  uniforms.uSkyAmb.value.set(...st.skyAmb); uniforms.uZenith.value.set(...st.zenith); uniforms.uHorizon.value.set(...st.horizon);
-  uniforms.uDusk.value.set(...st.dusk); uniforms.uSunDisc.value.set(...st.sunDisc);
-  uniforms.uNight.value = st.night; uniforms.uSkyRot.value.set(...st.rot);
-}
-
-// Light pass: world traced at 1/LIGHT_DIV resolution into a float target; sky / sun / point-light rays are cast there once
-// per texel and the full-res pass reuses them (see LIGHT_PASS / fetchLight in shader.js). Needs float render targets.
-const useLightBuffer = HALF_RES_LIGHT && renderer.extensions.has('EXT_color_buffer_float');
-if (HALF_RES_LIGHT && !useLightBuffer) console.warn('EXT_color_buffer_float missing: light pass disabled, using per-pixel rays');
-
-const material = new THREE.ShaderMaterial({
-  glslVersion: THREE.GLSL3,
-  uniforms, vertexShader: vert, fragmentShader: frag,
-  defines: useLightBuffer ? { USE_LIGHT_BUFFER: 1 } : {},
-  depthTest: false, depthWrite: false,
+const uniforms = createUniforms({
+  world, voxelTex, coarseTex, superTex, particleTex, glowTex, lavaGlow,
+  lightPos, lightCol, lightCount, palette, skyU, LAVA_GLOW_COL, v3,
 });
+const applySky = (st) => applySkyUniforms(uniforms, st);   // push a sky state into the shader uniforms
 
-const scene = new THREE.Scene();
-const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1); // unused by the shader
-const quadGeo = new THREE.PlaneGeometry(2, 2);
-const quad = new THREE.Mesh(quadGeo, material);
-quad.frustumCulled = false;
-scene.add(quad);
-
-const lightRT = new THREE.WebGLRenderTarget(1, 1, {
-  type: THREE.FloatType, format: THREE.RGBAFormat,
-  minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
-  depthBuffer: false, stencilBuffer: false,
-});
-uniforms.uLightTex.value = lightRT.texture;
-// same uniforms, except its own resolution and no light texture (it writes that texture, so it must not read it)
-const lightUniforms = { ...uniforms, uRes: { value: new THREE.Vector2(1, 1) }, uLightTex: { value: null } };
-const lightMaterial = new THREE.ShaderMaterial({
-  glslVersion: THREE.GLSL3,
-  uniforms: lightUniforms, vertexShader: vert, fragmentShader: frag,
-  defines: { LIGHT_PASS: 1 },
-  depthTest: false, depthWrite: false,
-});
-const lightScene = new THREE.Scene();
-const lightQuad = new THREE.Mesh(quadGeo, lightMaterial);
-lightQuad.frustumCulled = false;
-lightScene.add(lightQuad);
-
-function resize() {
-  const r = canvas.getBoundingClientRect();
-  const h = INTERNAL_HEIGHT;
-  const w = Math.max(1, Math.round(h * r.width / Math.max(1, r.height)));
-  renderer.setSize(w, h, false);       // false = don't touch CSS size; CSS upscales
-  uniforms.uRes.value.set(w, h);
-  uniforms.uAspect.value = w / h;
-  const lw = Math.max(1, Math.ceil(w / LIGHT_DIV)), lh = Math.max(1, Math.ceil(h / LIGHT_DIV));
-  lightRT.setSize(lw, lh);
-  uniforms.uResLow.value.set(lw, lh);
-  lightUniforms.uRes.value.set(lw, lh);
-}
-window.addEventListener('resize', resize);
-resize();
+const { material, lightMaterial, scene, lightScene, camera, lightRT, lightUniforms, useLightBuffer } = createPipeline({ renderer, canvas, uniforms });
 
 // ---------------------------------------------------------------- physics + player
 const physics = await createPhysics(world);   // collision mesh + Rapier world (a second or two)
@@ -276,79 +109,17 @@ const hint = document.getElementById('hint');
 const modeEl = document.getElementById('mapcap');   // reuse the caption under the minimap for the gun mode
 if (hint) hint.textContent = 'Click to look · WASD move · Shift sprint · Space jump · F fly (Space up, C down) · M map · T time of day (normal / fast / paused) · F3 debug · Esc release mouse · Shift+L: clear lava · Scroll wheel (or G): swap grenades / LAVA GUN · Click: fire (lava gun: hold to spray) · Right click: heavy shell (hold to keep firing)';
 
-// ---------------------------------------------------------------- F3 debug overlay
-const stats = { shots: 0, blasts: 0, lastBlast: null };   // counters updated by shoot() / detonate()
-const GL_DEBUG = gl.getExtension('WEBGL_debug_renderer_info');
-const gpuName = GL_DEBUG ? gl.getParameter(GL_DEBUG.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
-const MATERIALS = ['air', 'stone', 'grass', 'dungeon floor', 'wood', 'brick', 'flame', 'scorched stone', 'lava', 'leaves', 'boulder'];
-const COMPASS = ['N (-Z)', 'NE', 'E (+X)', 'SE', 'S (+Z)', 'SW', 'W (-X)', 'NW'];
-const debugEl = document.getElementById('debug');
-const debug = debugEl && new DebugOverlay(debugEl, () => {
-  const { forward } = Player.basis(input.yaw, input.pitch);
-  player.eyeVoxels(eye);
-  const hit = raycastVoxels(world, [eye.x, eye.y, eye.z], forward, 400 * M2V);
-  const yawDeg = ((THREE.MathUtils.radToDeg(input.yaw) % 360) + 360) % 360;
-  const heading = Math.atan2(forward[0], -forward[2]);                    // 0 = facing -Z, like the player's yaw
-  const r = canvas.getBoundingClientRect();
-  return {
-    gpu: gpuName, calls: renderer.info.render.calls, maxTex3D, fov: FOV_DEG, levels: DITHER_LEVELS, ditherStrength: DITHER_STRENGTH,
-    res: [uniforms.uRes.value.x, uniforms.uRes.value.y], canvas: [Math.round(r.width), Math.round(r.height)],
-    upscale: (r.height / uniforms.uRes.value.y).toFixed(2),
-    lights: uniforms.uLightCount.value, maxLights: MAX_LIGHTS, flashes: flashes.length,
-    pos: [player.x, player.y - player.centreOffset, player.z],
-    tile: [Math.floor(player.x / TILE_M), Math.floor(player.z / TILE_M)],
-    voxel: [eye.x, eye.y, eye.z],
-    vel: [player.vx, player.vy, player.vz], speed: Math.hypot(player.vx, player.vy, player.vz),
-    yaw: yawDeg, pitch: THREE.MathUtils.radToDeg(input.pitch),
-    facing: COMPASS[Math.round(((heading + Math.PI * 2) % (Math.PI * 2)) / (Math.PI / 4)) % 8],
-    state: `${player.onGround ? 'on ground' : 'airborne'}${player.fly ? ' · fly' : ''}`, locked: input.locked,
-    look: hit ? { id: voxelAt(world, ...hit.cell), name: MATERIALS[voxelAt(world, ...hit.cell)] ?? '?', cell: hit.cell, dist: hit.t / M2V } : null,
-    shots: stats.shots, blasts: stats.blasts, lastBlast: stats.lastBlast, inFlight: projectiles.list.length,
-    cooldown: gunCooldown, shake,
-    particles: particles.count, packed: particles.packed, maxParticles: MAX_PARTICLES,
-    world: {
-      size: [world.size.x, world.size.y, world.size.z],
-      metres: [world.size.x, world.size.y, world.size.z].map((v) => (v / M2V).toFixed(1)),
-      mb: world.data.length / 1e6, bricks: [world.coarseSize.x, world.coarseSize.y, world.coarseSize.z],
-      tileVox: T, tileM: TILE_M,
-    },
-    tris: physics.triangles,
-    heap: performance.memory ? performance.memory.usedJSHeapSize / 1048576 : null,
-    time: performance.now() / 1000,
-  };
-});
-if (debug && SHOW_DEBUG) debug.toggle();
-addEventListener('keydown', (e) => {
-  if (e.code === 'KeyM' && !e.repeat) minimap?.toggle();
-  if (e.code === 'KeyT' && !e.repeat) { const m = skyClock.cycle(); const h = document.getElementById('hint'); if (h) { const old = h.textContent; h.textContent = 'Time: ' + m; setTimeout(() => { h.textContent = old; }, 1500); } }
-  if (e.code === 'F3') { e.preventDefault(); if (!e.repeat) debug?.toggle(); }
-});
+const stats = { shots: 0, blasts: 0, lastBlast: null };   // counters updated by shoot() / detonate(), shown in the F3 overlay
+
 
 
 // ---------------------------------------------------------------- explosions
 // 1. explode() edits world.data (voxels + coarse grid) on the CPU
 // 2. the changed box is pushed to the GPU texture with texSubImage3D (not the whole 80 MB volume)
 // 3. physics.updateRegion() works out which collision chunks changed; flushPending() re-meshes them a few ms per frame
-function uploadBox(tex, data, size, box) {
-  const glTex = renderer.properties.get(tex).__webglTexture;
-  if (!glTex) { tex.needsUpdate = true; return; }              // not on the GPU yet: the normal full upload covers it
-  const w = box.x1 - box.x0, h = box.y1 - box.y0, d = box.z1 - box.z0;
-  const buf = new Uint8Array(w * h * d);
-  let o = 0;
-  for (let z = box.z0; z < box.z1; z++) for (let y = box.y0; y < box.y1; y++) {
-    const row = box.x0 + size.x * (y + size.y * z);
-    buf.set(data.subarray(row, row + w), o);
-    o += w;
-  }
-  gl.bindTexture(gl.TEXTURE_3D, glTex);
-  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-  gl.texSubImage3D(gl.TEXTURE_3D, 0, box.x0, box.y0, box.z0, w, h, d, gl.RED, gl.UNSIGNED_BYTE, buf);
-  renderer.resetState();                                      // three caches GL bindings; we changed one behind its back
-}
+const uploadBox = createTextureUploader(renderer);   // see render/textures.js
 function uploadVoxelBox(box) { uploadBox(voxelTex, world.data, world.size, box); }
 function uploadGlowBox(box) { uploadBox(glowTex, lavaGlow.data, lavaGlow.size, box); }
-
-const flashes = [];   // { pos: [x,y,z] voxels, t0 }
 
 // Carve the crater, throw particles, flash the lights, knock the player back.
 // point / normal: where the shell hit (voxels). normal = [0,0,0] means an airburst.
@@ -399,56 +170,24 @@ function detonate(point, normal, radiusM) {
 }
 
 // ---------------------------------------------------------------- gun + projectiles
+const eye = new THREE.Vector3();   // camera position in voxels, refreshed by player.eyeVoxels(eye)
+let shake = 0;                     // camera shake, decays after a blast (set by detonate(), used by the frame loop)
 const projectiles = new Projectiles(world, {
   onImpact: ({ point, normal, radiusM }) => detonate(point, normal, radiusM),
   onTrail: (x, y, z, big) => particles.trail(x, y, z, big),
 });
 
-let gunCooldown = 0;
-let gunKick = 0, gunMuzzle = 0;                               // recoil + muzzle flash, both decay after a shot
-let bobPhase = 0, bobAmt = 0;
-const sway = { x: 0, y: 0 };
-let lastYaw = 0, lastPitch = 0;
+const weapons = createWeapons({ world, player, input, eye, lava, projectiles, stats, uniforms });
+const { gun, lavaGun, aimGun, shoot, selectGun } = weapons;   // gun = shared gun state, see game/weapons.js
 
-// where the muzzle is and which way it points (shared by the shells and the lava gun)
-function aimGun() {
-  const { forward, right, up } = Player.basis(input.yaw, input.pitch);
-  player.eyeVoxels(eye);
-
-  // muzzle position in the world
-  const barrel = [0, 1, 2].map((i) => eye.getComponent(i) + right[i] * GUN_TIP[0] + up[i] * GUN_TIP[1] + forward[i] * GUN_TIP[2]);
-
-  // the barrel sits off to the side, so aim at whatever the crosshair is on (or a far point if it sees nothing close)
-  const crosshair = raycastVoxels(world, [eye.x, eye.y, eye.z], forward, AIM_CONVERGE_M * M2V);
-  const aimDist = crosshair ? Math.max(crosshair.t, 12) : AIM_CONVERGE_M * M2V;
-  const target = [eye.x + forward[0] * aimDist, eye.y + forward[1] * aimDist, eye.z + forward[2] * aimDist];
-  let dir = [target[0] - barrel[0], target[1] - barrel[1], target[2] - barrel[2]];
-  const dl = Math.hypot(...dir) || 1;
-  dir = dir.map((v) => v / dl);
-
-  // if the barrel is poking into a wall, fire from the eye instead (the shellgit  will blow up right in front of you)
-  let start = barrel;
-  const toBarrel = [barrel[0] - eye.x, barrel[1] - eye.y, barrel[2] - eye.z];
-  const bl = Math.hypot(...toBarrel) || 1;
-  if (raycastVoxels(world, [eye.x, eye.y, eye.z], toBarrel.map((v) => v / bl), bl)) start = [eye.x, eye.y, eye.z];
-  return { start, dir };
-}
-
-function shoot(shot) {
-  const { start, dir } = aimGun();
-
-  const sp = shot.speed * M2V;
-  projectiles.spawn(start, [
-    dir[0] * sp + player.vx * M2V * INHERIT_VELOCITY,
-    dir[1] * sp + player.vy * M2V * INHERIT_VELOCITY,
-    dir[2] * sp + player.vz * M2V * INHERIT_VELOCITY,
-  ], { gravity: shot.gravity * M2V, radiusM: shot.radiusM, big: shot.big });
-
-  stats.shots++;
-  gunCooldown = shot.cooldown;
-  gunKick = Math.max(gunKick, shot.kick);
-  gunMuzzle = 1;
-}
+// ---------------------------------------------------------------- F3 debug overlay + hotkeys
+const debug = createDebugHud({ renderer, canvas, uniforms, world, physics, player, input, eye, projectiles, particles,
+                               stats, flashes, MAX_LIGHTS, gun, getShake: () => shake });
+addEventListener('keydown', (e) => {
+  if (e.code === 'KeyM' && !e.repeat) minimap?.toggle();
+  if (e.code === 'KeyT' && !e.repeat) { const m = skyClock.cycle(); const h = document.getElementById('hint'); if (h) { const old = h.textContent; h.textContent = 'Time: ' + m; setTimeout(() => { h.textContent = old; }, 1500); } }
+  if (e.code === 'F3') { e.preventDefault(); if (!e.repeat) debug?.toggle(); }
+});
 
 // ---------------------------------------------------------------- lava
 // LavaSim (lava.js) writes id-8 voxels into world.data; we push the changed box to the GPU like explosions do.
@@ -460,195 +199,138 @@ addEventListener('keydown', (e) => {
   if (e.shiftKey) { lava.clear(); const b = lava.flush(); if (b) { uploadVoxelBox(b); coarseTex.needsUpdate = true; refreshSuper(b); } }
 });
 
-// ---------------------------------------------------------------- lava gun (G toggles; left click sprays, hold to keep pouring)
-const lavaGun = new LavaGun(world, lava, { rate: 90, speed: 30 * M2V, spread: 0.025, gravity: 7 * M2V });
-let lavaMode = false;                       // which gun is actually in hand (switches halfway through the swap animation)
-let wantLava = false, swapT = 1;            // swapT: 0..1 = swap in progress, 1 = idle
-function selectGun(lava) {                  // scroll wheel / G: lower the gun, switch model, raise it again
-  if (lava === wantLava && swapT >= 1) return;
-  wantLava = lava; swapT = 0;
-}
-addEventListener('keydown', (e) => { if (e.code === 'KeyG' && !e.repeat) selectGun(!wantLava); });
 
 // ---------------------------------------------------------------- loop
+// frame() just calls the small steps below, in this order. Each step is one job; edit the step, not frame().
 let last = performance.now();
-let acc = 0;
-const eye = new THREE.Vector3();
-let shake = 0;    // camera shake, decays after a blast
+let acc = 0;               // leftover time for the fixed-step simulation (see stepSimulation)
 let particlesLive = false;
-let torchK = 1;   // 0 = torch at the eye, 1 = full offset
+
+// 1. fixed-timestep simulation (60 Hz); rendering interpolates between ticks
+function stepSimulation(dt) {
+    input.frameUpdate(dt);
+    acc += dt;
+    while (acc >= FIXED_DT) {
+      player.tick(input.sample());
+      projectiles.update(FIXED_DT);
+      lavaGun.update(FIXED_DT);
+      acc -= FIXED_DT;
+    }
+}
+
+// 2. gun controls: scroll / G swap animation, then fire (grenades or lava spray)
+function updateGunControls(dt) {
+    const wheel = input.consumeWheel();                          // trackpads spam events: ignore them while a swap is running
+    if (wheel && input.locked && gun.swapT >= 1) selectGun(!gun.wantLava);
+    if (gun.swapT < 1) {
+      gun.swapT = Math.min(1, gun.swapT + dt / 0.32);
+      if (gun.swapT >= 0.5 && gun.lavaMode !== gun.wantLava) {                 // gun is off-screen: swap the model
+        gun.lavaMode = gun.wantLava;
+        uniforms.uGunType.value = gun.lavaMode ? 1 : 0;
+        if (modeEl) modeEl.textContent = `SEED ${seed} · ${gun.lavaMode ? 'LAVA GUN' : 'GRENADES'}`;
+        gun.cooldown = Math.max(gun.cooldown, 0.1);
+      }
+    }
+    const fire = input.consumeFire() || input.fireHeld;
+    gun.cooldown -= dt;
+    if (gun.swapT < 1) { /* gun is changing */ }
+    else if (gun.lavaMode && fire === 1 && input.locked) {
+      const { start, dir } = aimGun();
+      lavaGun.emit(dt, start, dir, [player.vx * M2V * INHERIT_VELOCITY, player.vy * M2V * INHERIT_VELOCITY, player.vz * M2V * INHERIT_VELOCITY]);
+      gun.muzzle = Math.max(gun.muzzle, 0.55);                     // keep the muzzle glowing while it sprays
+      gun.kick = Math.max(gun.kick, 0.12);
+    } else if (fire && gun.cooldown <= 0 && input.locked) shoot(fire === 2 ? SHOTS.big : SHOTS.small);
+}
+
+// 3. player: finish queued collision rebuilds, then smooth the player's render position
+function updatePlayer(dt) {
+    physics.flushPending(3, [mToVoxX(player.x), mToVoxZ(player.z)]);   // finish queued collision rebuilds, ~3 ms per frame (nearest the player first)
+
+    player.alpha = acc / FIXED_DT;
+    player.frameUpdate(dt);
+}
+
+// 4. camera: look direction (with blast shake) and position -> shader uniforms. Returns the right vector (the torch needs it)
+function updateCamera(dt) {
+    // camera uses the freshest look angles, not the last tick's
+    const { forward, right, up } = Player.basis(input.yaw, input.pitch);
+    player.eyeVoxels(eye);
+    uniforms.uCamPos.value.copy(eye);
+    if (shake > 0.01) {
+      const k = shake * shake * 0.03;                        // look wobble (radians-ish)
+      const sx = Math.random() * 2 - 1, sy = Math.random() * 2 - 1;
+      uniforms.uCamFwd.value.set(forward[0] + right[0] * sx * k + up[0] * sy * k, forward[1] + right[1] * sx * k + up[1] * sy * k, forward[2] + right[2] * sx * k + up[2] * sy * k).normalize();
+      shake *= Math.exp(-5 * dt);
+    } else {
+      shake = 0;
+      uniforms.uCamFwd.value.set(...forward);
+    }
+    uniforms.uCamRight.value.set(...right);
+    uniforms.uCamUp.value.set(...up);
+  return right;
+}
+
+// 5. lava: fixed-rate sim, upload changed voxels, refresh the glow field
+function updateLava(dt) {
+    // lava: fixed-rate sim, upload the dirty box, then refresh the glow field
+    lavaAcc += dt;
+    for (let n = 0; lavaAcc >= LAVA_STEP && n < 3; n++) { lava.step(); lavaAcc -= LAVA_STEP; }
+    if (lavaAcc > LAVA_STEP * 3) lavaAcc = 0;
+    const lbox = lava.flush();
+    if (lbox) { uploadVoxelBox(lbox); coarseTex.needsUpdate = true; refreshSuper(lbox); }
+    const gbox = lavaGlow.update(dt);                           // rebuilds (<= ~7x/s) only when lava changed; light spreads from resting cells
+    if (gbox) uploadGlowBox(gbox);
+}
+
+// 6. particles: simulate, pack, upload only while something is alive
+function updateParticles(dt) {
+    // particles: simulate, pack, upload only while something is alive
+    particles.update(dt);
+    const shells = projectiles.cubes(acc / FIXED_DT).concat(lavaGun.cubes(acc / FIXED_DT));
+    if (particles.count > 0 || shells.length > 0 || particlesLive) {
+      particles.pack(shells);
+      uniforms.uParticleCount.value = particles.packed;
+      uniforms.uPBound.value.set(...particles.bound);
+      particleTex.needsUpdate = true;
+      particlesLive = particles.count > 0 || shells.length > 0;
+    }
+}
+
+// 7. draw: half-res light pass first (if enabled), then the full-res pass
+function renderScene() {
+    if (useLightBuffer) {
+      renderer.setRenderTarget(lightRT);
+      renderer.render(lightScene, camera);
+      renderer.setRenderTarget(null);
+    }
+    renderer.render(scene, camera);
+}
+
 function frame(now) {
   const cpuStart = performance.now();
   const rawMs = now - last;
   const dt = Math.min(MAX_FRAME_DT, rawMs / 1000);
   last = now;
   const time = now / 1000;
+
   uniforms.uTime.value = time;
   skyClock.update(dt);
   applySky(skyState(skyClock.tod));
 
-  // fixed-timestep simulation (60 Hz), render interpolates between ticks
-  input.frameUpdate(dt);
-  acc += dt;
-  while (acc >= FIXED_DT) {
-    player.tick(input.sample());
-    projectiles.update(FIXED_DT);
-    lavaGun.update(FIXED_DT);
-    acc -= FIXED_DT;
-  }
-  const wheel = input.consumeWheel();                          // trackpads spam events: ignore them while a swap is running
-  if (wheel && input.locked && swapT >= 1) selectGun(!wantLava);
-  if (swapT < 1) {
-    swapT = Math.min(1, swapT + dt / 0.32);
-    if (swapT >= 0.5 && lavaMode !== wantLava) {                 // gun is off-screen: swap the model
-      lavaMode = wantLava;
-      uniforms.uGunType.value = lavaMode ? 1 : 0;
-      if (modeEl) modeEl.textContent = `SEED ${seed} · ${lavaMode ? 'LAVA GUN' : 'GRENADES'}`;
-      gunCooldown = Math.max(gunCooldown, 0.1);
-    }
-  }
-  const fire = input.consumeFire() || input.fireHeld;
-  gunCooldown -= dt;
-  if (swapT < 1) { /* gun is changing */ }
-  else if (lavaMode && fire === 1 && input.locked) {
-    const { start, dir } = aimGun();
-    lavaGun.emit(dt, start, dir, [player.vx * M2V * INHERIT_VELOCITY, player.vy * M2V * INHERIT_VELOCITY, player.vz * M2V * INHERIT_VELOCITY]);
-    gunMuzzle = Math.max(gunMuzzle, 0.55);                     // keep the muzzle glowing while it sprays
-    gunKick = Math.max(gunKick, 0.12);
-  } else if (fire && gunCooldown <= 0 && input.locked) shoot(fire === 2 ? SHOTS.big : SHOTS.small);
+  stepSimulation(dt);
+  updateGunControls(dt);
+  updatePlayer(dt);
+  const right = updateCamera(dt);
 
-  physics.flushPending(3, [mToVoxX(player.x), mToVoxZ(player.z)]);   // finish queued collision rebuilds, ~3 ms per frame (nearest the player first)
+  lights.update({ eye, right, player, solidVoxel, projectiles, lavaGun, uniforms, alpha: acc / FIXED_DT, dt, time });
+  weapons.animate(dt, time);
 
-  player.alpha = acc / FIXED_DT;
-  player.frameUpdate(dt);
-
-  // camera uses the freshest look angles, not the last tick's
-  const { forward, right, up } = Player.basis(input.yaw, input.pitch);
-  player.eyeVoxels(eye);
-  uniforms.uCamPos.value.copy(eye);
-  if (shake > 0.01) {
-    const k = shake * shake * 0.03;                        // look wobble (radians-ish)
-    const sx = Math.random() * 2 - 1, sy = Math.random() * 2 - 1;
-    uniforms.uCamFwd.value.set(forward[0] + right[0] * sx * k + up[0] * sy * k, forward[1] + right[1] * sx * k + up[1] * sy * k, forward[2] + right[2] * sx * k + up[2] * sy * k).normalize();
-    shake *= Math.exp(-5 * dt);
-  } else {
-    shake = 0;
-    uniforms.uCamFwd.value.set(...forward);
-  }
-  uniforms.uCamRight.value.set(...right);
-  uniforms.uCamUp.value.set(...up);
-
-  // torch: held to the right of the eye, pulled back if it would end up inside stone
-  const o = player.o;
-  const mv = T / TILE_M;
-  const dx = right[0] * o.torchRight * mv, dy = o.torchUp * mv, dz = right[2] * o.torchRight * mv;
-  let target = 1;
-  for (let i = 1; i <= 12; i++) {                      // slide back along the offset to just before any stone
-    const f = i / 12;
-    if (solidVoxel(eye.x + dx * f, eye.y + dy * f, eye.z + dz * f)) {
-      target = Math.max(0, (i - 1) / 12 - 3 / Math.hypot(dx, dy, dz));   // 3 voxel margin
-      break;
-    }
-  }
-  torchK = target < torchK ? target : torchK + (target - torchK) * (1 - Math.exp(-20 * dt));   // retract instantly, ease back out
-  lightPos[0].set(eye.x + dx * torchK, eye.y + dy * torchK, eye.z + dz * torchK);
-
-  // flicker
-  lightCol[0].copy(torchBase).multiplyScalar(1 + 0.02 * Math.sin(time * 9));
-  staticLights.forEach((l, i) => {
-    if (l.dead) lightCol[i + 1].set(0, 0, 0);
-    else lightCol[i + 1].copy(l.base).multiplyScalar(1 + 0.10 * Math.sin(time * 7 + i * 2.3) + 0.06 * Math.sin(time * 19 + i));
-  });
-
-  // gun animation: recoil kick, walking bob, and lag when you turn
-  gunKick *= Math.exp(-11 * dt);
-  gunMuzzle *= Math.exp(-22 * dt);
-  const speed = player.onGround && !player.fly ? Math.hypot(player.vx, player.vz) : 0;
-  bobAmt += (Math.min(1, speed / 5) - bobAmt) * (1 - Math.exp(-8 * dt));
-  bobPhase += speed * dt * 1.7;
-  const dyaw = input.yaw - lastYaw, dpitch = input.pitch - lastPitch;
-  lastYaw = input.yaw; lastPitch = input.pitch;
-  sway.x = Math.max(-2, Math.min(2, sway.x - dyaw * 18)) * Math.exp(-9 * dt);
-  sway.y = Math.max(-2, Math.min(2, sway.y - dpitch * 18)) * Math.exp(-9 * dt);
-  uniforms.uGunOff.value.set(
-    Math.sin(bobPhase) * 0.35 * bobAmt + sway.x,
-    -Math.abs(Math.cos(bobPhase)) * 0.45 * bobAmt + Math.sin(time * 1.3) * 0.05 + 0.9 * gunKick + sway.y - 9 * Math.sin(Math.PI * swapT),
-    -3.0 * gunKick);
-  uniforms.uMuzzle.value = gunMuzzle > 0.03 ? gunMuzzle : 0;
-
-  // glowing shells light the corridor as they fly (up to two), explosion flashes fill the remaining slots
-  const dynSlots = MAX_LIGHTS - BASE_LIGHTS;
-  let used = 0;
-  for (let i = 0; i < projectiles.list.length && used < Math.min(2, dynSlots); i++, used++) {
-    const pp = projectiles.interpolated(acc / FIXED_DT, i);
-    lightPos[BASE_LIGHTS + used].set(pp[0], pp[1], pp[2]);
-    lightCol[BASE_LIGHTS + used].set(1.0, 0.6, 0.25).multiplyScalar((projectiles.list[i].big ? 3.4 : 2.4) * (1 + 0.2 * Math.sin(time * 40 + i)));
-  }
-
-  const lc = lavaGun.centroid();
-  if (lc && used < dynSlots) {
-    lightPos[BASE_LIGHTS + used].set(lc[0], lc[1], lc[2]);
-    lightCol[BASE_LIGHTS + used].set(1.0, 0.42, 0.1).multiplyScalar(2.6 * (1 + 0.15 * Math.sin(time * 37)));
-    used++;
-  }
-
-  // explosion flashes occupy the light slots after the torch and braziers
-  for (let i = flashes.length - 1; i >= 0; i--) if (time - flashes[i].t0 > FLASH_LIFE) flashes.splice(i, 1);
-  const firstFlash = Math.max(0, flashes.length - (dynSlots - used));
-  flashes.slice(firstFlash).forEach((f, i0) => {
-    const i = i0 + used;
-    const age = (time - f.t0) / FLASH_LIFE;
-    const flick = 1 + 0.25 * Math.sin(time * 31 + i * 5.1) + 0.15 * Math.sin(time * 53 + i);
-    const e = (0.75 * Math.exp(-age * 5) + 0.25 * Math.exp(-age * 1.6)) * (1 - age) * FLASH_PEAK * f.scale * flick;
-    lightPos[BASE_LIGHTS + i].set(f.pos[0], f.pos[1] + age * 6 * M2V * 0.25, f.pos[2]);   // the fire climbs a little as it burns
-    // white-orange at the start, cooling to red
-    lightCol[BASE_LIGHTS + i].set(1.0, 0.62 - 0.3 * age, 0.3 - 0.22 * age).multiplyScalar(e);
-  });
-  uniforms.uLightCount.value = BASE_LIGHTS + used + (flashes.length - firstFlash);
-
-  // lava: fixed-rate sim, upload the dirty box, then refresh the glow field
-  lavaAcc += dt;
-  for (let n = 0; lavaAcc >= LAVA_STEP && n < 3; n++) { lava.step(); lavaAcc -= LAVA_STEP; }
-  if (lavaAcc > LAVA_STEP * 3) lavaAcc = 0;
-  const lbox = lava.flush();
-  if (lbox) { uploadVoxelBox(lbox); coarseTex.needsUpdate = true; refreshSuper(lbox); }
-  const gbox = lavaGlow.update(dt);                           // rebuilds (<= ~7x/s) only when lava changed; light spreads from resting cells
-  if (gbox) uploadGlowBox(gbox);
-
-  // particles: simulate, pack, upload only while something is alive
-  particles.update(dt);
-  const shells = projectiles.cubes(acc / FIXED_DT).concat(lavaGun.cubes(acc / FIXED_DT));
-  if (particles.count > 0 || shells.length > 0 || particlesLive) {
-    particles.pack(shells);
-    uniforms.uParticleCount.value = particles.packed;
-    uniforms.uPBound.value.set(...particles.bound);
-    particleTex.needsUpdate = true;
-    particlesLive = particles.count > 0 || shells.length > 0;
-  }
-
+  updateLava(dt);
+  updateParticles(dt);
   minimap?.draw({ x: mToVoxX(player.x), z: mToVoxZ(player.z), yaw: input.yaw }, time);
 
-  if (useLightBuffer) {
-    renderer.setRenderTarget(lightRT);
-    renderer.render(lightScene, camera);
-    renderer.setRenderTarget(null);
-  }
-  renderer.render(scene, camera);
+  renderScene();
   debug?.frame(rawMs, performance.now() - cpuStart);
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
-
-// Vite hot-swap: edit shader.js and see it live without losing your position
-if (import.meta.hot) {
-  import.meta.hot.accept('./shader.js', (mod) => {
-    if (!mod) return;
-    material.vertexShader = mod.vert;
-    material.fragmentShader = mod.frag;
-    material.needsUpdate = true;
-    lightMaterial.vertexShader = mod.vert;
-    lightMaterial.fragmentShader = mod.frag;
-    lightMaterial.needsUpdate = true;
-  });
-  
-}
